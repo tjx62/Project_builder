@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "crewai-streamlit-sequential-quickstart"
+version = "0.0.1"
+description = ""
+authors = ["Alex Fazio <alessandro.fazio@me.com>"]
+
+[tool.poetry.scripts]
+crcrewai-streamlit-sequential-quickstart = "main:main"
+
+[tool.poetry.dependencies]
+python = ">=3.10,<=3.13"
+pydantic = "*"
+crewai = {extras = ["google-genai"], version = "^1.14.6"}
+streamlit = "*"
+pandas = "*"
+watchdog = "*"
+setuptools = "*"
+python-decouple = "*"
+langchain-community = "*"
+langchain_groq = "*"
+langchain-anthropic = "*"
+python-dotenv = "^1.2.2"
+boto3 = "^1.43.17"
+
+[[tool.poetry.packages]]
+include = "*.py"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

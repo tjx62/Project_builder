@@ -1,0 +1,20 @@
+# Secrets / environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json
+
+# Windows Zone.Identifier (alternate data stream) artifacts
+*Zone.Identifier
+
+# Terraform state / vars (workspace may live here)
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
