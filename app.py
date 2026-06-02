@@ -24,6 +24,7 @@ from tasks import build_tasks, build_remediation_tasks
 from tools import (
     commit_audited_output, read_workspace_context, write_findings,
     parse_finding_files, read_specific_files,
+    terraform_validate, render_validation_findings,
 )
 
 # Architect runs only for requests with more than this many specialists; simple
@@ -899,14 +900,28 @@ elif st.session_state.phase == "execute":
                         audit_result = audit_crew.kickoff()
                         audit_text   = str(getattr(audit_result, "raw", "") or audit_result)
 
+                        # Deterministic integration check: terraform validate catches
+                        # broken cross-resource references (e.g. an IAM policy pointing at
+                        # a bucket that doesn't exist) that the compliance audit misses.
+                        # Its errors are folded into the findings so the next round's
+                        # fixer repairs them alongside compliance gaps.
+                        tf = terraform_validate(project_path)
+                        tf_clean = (not tf["ran"]) or tf["ok"]
+                        if not tf_clean:
+                            audit_text += "\n\n" + render_validation_findings(tf["errors"])
+                            log_queue.put(
+                                f"__INFO__:terraform validate found {len(tf['errors'])} "
+                                f"error(s) (round {round_num})"
+                            )
+
                         write_findings(audit_result, project_path, framework_name)
 
-                        if _is_compliant(audit_text):
+                        if _is_compliant(audit_text) and tf_clean:
                             log_queue.put(f"__COMPLIANT__:{round_num}")
                             converged = True
                             break
                         else:
-                            count = _count_findings(audit_text)
+                            count = _count_findings(audit_text) + len(tf["errors"])
                             log_queue.put(f"__FINDINGS__:{round_num}:{count}")
 
                     result_holder["result"]          = gen_result
@@ -935,6 +950,16 @@ elif st.session_state.phase == "execute":
                     result_holder["git_result"] = commit_audited_output(
                         crew_result, has_auditor=has_auditor
                     )
+                    # Single pass has no fix loop, so terraform validate is
+                    # informational here — surface any wiring errors to the user.
+                    tf = terraform_validate(project_path)
+                    if tf["ran"] and not tf["ok"]:
+                        files = ", ".join(sorted({e["file"] for e in tf["errors"] if e["file"]}))
+                        log_queue.put(
+                            f"__INFO__:⚠️ terraform validate found {len(tf['errors'])} "
+                            f"error(s) in {files or 'the config'} — consider auto-iterate to fix."
+                        )
+                        result_holder["validation"] = tf["errors"]
                     log_queue.put(f"__DONE__:{git_step_idx}:Git")
 
             except SystemExit:

@@ -53,7 +53,7 @@ planner.py        — Lightweight planning agent that picks specialists
 specialists.py    — Registry of all specialist agents + descriptions
 agents.py         — Supporting agents (architect, auditor, remediation engineer; legacy manager/git/assembler kept but unused)
 tasks.py          — Dynamic task builder (full pipeline + targeted remediation)
-tools.py          — File write/read/list, git commit, pure-Python variables.tf/outputs.tf generation
+tools.py          — File write/read/list, git commit, pure-Python variables.tf/outputs.tf generation, resource manifest, terraform validate
 CLAUDE.md         — This file
 ```
 
@@ -88,6 +88,12 @@ When the user enables auto-iterate, the pipeline loops generate → audit → fi
 - The commit step is given an `allowed_files` set in remediation rounds, so any extra file the fixer regenerated but wasn't asked to touch is discarded (never overwrites an unaffected file).
 - If a round's findings don't map to specific files, it falls back to a full pass.
 - `variables.tf`/`outputs.tf` are excluded from the fixer's scope (regenerated in Python).
+
+### Integration check — `terraform validate` (`tools.terraform_validate`)
+The compliance auditor checks *compliance*, not *functional wiring* (does an IAM policy actually reference a bucket that exists?). Each auto-iterate round runs `terraform validate` after committing; any errors are rendered as findings (`render_validation_findings`, with `**File:**` lines the fixer's `parse_finding_files` picks up) and folded into the audit text, so the next round's fixer repairs broken references alongside compliance gaps. Convergence requires **both** a clean compliance audit and a clean validate. It uses `-backend=false` (never touches cloud state/credentials) and degrades gracefully: if there are no `.tf` files, terraform isn't installed, or init fails, it skips without blocking. The normal single-pass mode runs it informationally (no fix loop) and surfaces errors as a warning.
+
+### Cross-resource coordination (`tasks.py`)
+To reduce broken wiring at generation time: when an architect runs (3+ specialists) it's given a **coordination mandate** — name the exact resource addresses and the glue resources (IAM roles/policies, SG rules) each specialist must create. Specialists get a **resource manifest** (`tools.build_resource_manifest` — a compact list of existing `type.name` addresses from the workspace) plus a wiring instruction to reference real addresses and create needed glue. `terraform validate` (above) is the deterministic net for whatever still slips through.
 
 ### Model Tiers
 | Agent | Model | Reason |

@@ -182,7 +182,11 @@ def generate_outputs(tf_texts: list[str]) -> str | None:
     This replaces the LLM-backed Terraform Assembler: the transform is purely
     mechanical, so doing it in Python saves a full agent's worth of output tokens.
     """
+    # Output names use {type_short}_{rname}_{attr} to avoid collisions when
+    # multiple resource types share the same local name (e.g. aws_vpc.main and
+    # aws_flow_log.main would both produce "main_id" under a name-only scheme).
     seen: set[tuple[str, str]] = set()
+    used_names: set[str] = set()
     blocks: list[str] = []
     for text in tf_texts:
         for rtype, rname in _RESOURCE_DECL.findall(text):
@@ -190,9 +194,15 @@ def generate_outputs(tf_texts: list[str]) -> str | None:
                 continue
             seen.add((rtype, rname))
             attrs = _OUTPUT_ATTRS.get(rtype, ['id'])
+            type_short = rtype.replace("aws_", "").replace("google_", "").replace("azurerm_", "")
+            prefix = f"{type_short}_{rname}"
             for attr in attrs:
+                out_name = f"{prefix}_{attr}"
+                if out_name in used_names:
+                    continue
+                used_names.add(out_name)
                 blocks.append(
-                    f'output "{rname}_{attr}" {{\n'
+                    f'output "{out_name}" {{\n'
                     f'  description = "{attr} of {rtype}.{rname}"\n'
                     f'  value       = {rtype}.{rname}.{attr}\n'
                     f'}}'
@@ -200,6 +210,29 @@ def generate_outputs(tf_texts: list[str]) -> str | None:
     if not blocks:
         return None
     return '\n\n'.join(blocks) + '\n'
+
+
+def build_resource_manifest(*texts: str) -> str | None:
+    """Compact list of the Terraform resource addresses found in the given text(s).
+
+    Used to tell each specialist which resources already exist — so it references
+    them by their exact `<type>.<name>` address and creates any required glue (IAM
+    roles, SG rules, etc.) — without pasting full file contents into the prompt.
+    Returns None if no resources are found.
+    """
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for text in texts:
+        if not text:
+            continue
+        for rtype, rname in _RESOURCE_DECL.findall(text):
+            addr = f"{rtype}.{rname}"
+            if addr not in seen:
+                seen.add(addr)
+                ordered.append(addr)
+    if not ordered:
+        return None
+    return "\n".join(f"- {a}" for a in ordered)
 
 
 _FINDING_FILE = re.compile(r"\*\*File:\*\*\s*`?([^\s`*]+)`?")
@@ -241,6 +274,159 @@ def read_specific_files(base_dir: str, filenames: set[str]) -> str | None:
         ext = path.suffix.lstrip(".")
         sections.append(f"### File: {name}\n```{ext}\n{content.rstrip()}\n```")
     return "\n\n".join(sections) if sections else None
+
+
+def terraform_validate(base_dir: str) -> dict:
+    """Run `terraform validate` against the workspace and return diagnostics.
+
+    Deterministic integration check: catches undefined resource references,
+    missing required arguments, and bad attribute names — i.e. the "one
+    specialist referenced another's resource that doesn't exist / wasn't wired
+    up" class of bug that the compliance auditor does not look for.
+
+    Returns {'ran': bool, 'ok': bool, 'errors': [{'file','summary','detail'}], 'note': str}.
+    ran=False (with a note, ok=True) when it could not meaningfully run — no .tf
+    files, terraform not installed, or init/parse failure — so callers skip
+    rather than treat it as a finding. Uses -backend=false so it never touches
+    remote state or cloud credentials.
+    """
+    import json
+    import shutil
+    from pathlib import Path
+
+    root = Path(base_dir).resolve()
+    if not root.is_dir() or not list(root.rglob("*.tf")):
+        return {"ran": False, "ok": True, "errors": [], "note": "no terraform files"}
+    if shutil.which("terraform") is None:
+        return {"ran": False, "ok": True, "errors": [], "note": "terraform not installed"}
+
+    # Match:  Error: Duplicate data "aws_caller_identity" configuration
+    #   then:    on b.tf line 1:
+    _INIT_ERROR_BLOCK = re.compile(
+        r"Error:\s+(.+?)(?=\nError:|\Z)", re.DOTALL
+    )
+    _INIT_FILE_REF = re.compile(r"\bon\s+(\S+\.tf)\s+line\s+\d+")
+    _DUPLICATE_SUMMARY = re.compile(
+        r"Duplicate\s+(\w[\w ]+?)\s+\"([^\"]+)\"\s+\w+", re.IGNORECASE
+    )
+
+    try:
+        init = subprocess.run(
+            ["terraform", "init", "-backend=false", "-input=false", "-no-color"],
+            capture_output=True, cwd=base_dir, timeout=180,
+        )
+        if init.returncode != 0:
+            stderr = init.stderr.decode("utf-8", "replace")
+            # Terraform 1.x parses the config during init and surfaces config errors
+            # (duplicate blocks, invalid syntax) before downloading providers.
+            # Surface these as validate-style findings so the fixer can act on them.
+            if "problems with the configuration" in stderr or re.search(
+                r"Duplicate|already declared|Invalid", stderr
+            ):
+                errors = []
+                # For duplicate errors, find ALL .tf files that declare the
+                # offending block so the fixer sees the full picture and can
+                # decide which file keeps it and which removes it.
+                _DATA_DECL = re.compile(
+                    r'^data\s+"([^"]+)"\s+"([^"]+)"', re.MULTILINE
+                )
+                _RES_DECL = re.compile(
+                    r'^resource\s+"([^"]+)"\s+"([^"]+)"', re.MULTILINE
+                )
+                from pathlib import Path as _Path
+                tf_contents: dict[str, str] = {}
+                for tf in sorted(_Path(base_dir).glob("*.tf")):
+                    try:
+                        tf_contents[tf.name] = tf.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        pass
+
+                for block in _INIT_ERROR_BLOCK.findall(stderr):
+                    block = block.strip()
+                    if not block or block.startswith("Terraform encountered"):
+                        continue
+                    file_m = _INIT_FILE_REF.search(block)
+                    fname  = file_m.group(1) if file_m else ""
+                    dup_m  = _DUPLICATE_SUMMARY.search(block)
+                    if dup_m:
+                        kind, btype = dup_m.group(1).strip(), dup_m.group(2)
+                        # Find every file that declares this block type so fixer
+                        # can see all copies and resolve the conflict.
+                        if kind.lower() == "data":
+                            pattern = re.compile(
+                                rf'^data\s+"{re.escape(btype)}"\s+"[^"]+"', re.MULTILINE
+                            )
+                        else:
+                            pattern = re.compile(
+                                rf'^resource\s+"{re.escape(btype)}"\s+"[^"]+"', re.MULTILINE
+                            )
+                        all_files = sorted(
+                            f for f, txt in tf_contents.items() if pattern.search(txt)
+                        )
+                        file_list = ", ".join(all_files) if all_files else fname
+                        summary = f'Duplicate {kind} "{btype}" — declared in: {file_list}'
+                        detail  = (
+                            f'"{btype}" is declared in multiple .tf files ({file_list}). '
+                            "Keep it in exactly one file (typically the specialist that "
+                            "primarily uses it) and remove all other declarations."
+                        )
+                        # Emit one finding per duplicate file so parse_finding_files
+                        # picks them all up and the fixer receives all of them.
+                        for f in (all_files or [fname]):
+                            errors.append({"file": f, "summary": summary, "detail": detail})
+                    else:
+                        summary = block.splitlines()[0][:120]
+                        detail  = block[:300]
+                        errors.append({"file": fname, "summary": summary, "detail": detail})
+                if errors:
+                    return {"ran": True, "ok": False, "errors": errors, "note": ""}
+            note = stderr.strip()[:300]
+            return {"ran": False, "ok": True, "errors": [], "note": f"terraform init failed: {note}"}
+        res = subprocess.run(
+            ["terraform", "validate", "-json"],
+            capture_output=True, cwd=base_dir, timeout=180,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return {"ran": False, "ok": True, "errors": [], "note": f"terraform run error: {e}"}
+
+    try:
+        data = json.loads(res.stdout.decode("utf-8", "replace"))
+    except json.JSONDecodeError:
+        return {"ran": False, "ok": True, "errors": [], "note": "could not parse validate output"}
+
+    if data.get("valid", True):
+        return {"ran": True, "ok": True, "errors": [], "note": ""}
+
+    errors = []
+    for d in data.get("diagnostics", []):
+        if d.get("severity") != "error":
+            continue
+        errors.append({
+            "file": (d.get("range") or {}).get("filename", ""),
+            "summary": d.get("summary", ""),
+            "detail": d.get("detail", ""),
+        })
+    return {"ran": True, "ok": not errors, "errors": errors, "note": ""}
+
+
+def render_validation_findings(errors: list[dict]) -> str:
+    """Format terraform validate errors as a findings block the remediation
+    fixer can consume (the **File:** lines are picked up by parse_finding_files).
+    """
+    lines = [
+        "## Terraform Validation Errors",
+        f"{len(errors)} error(s) from `terraform validate` must be fixed:\n",
+    ]
+    for i, e in enumerate(errors, 1):
+        lines.append(f"### Validation Error {i} — {e.get('summary', 'invalid configuration')}")
+        if e.get("file"):
+            lines.append(f"**File:** {e['file']}")
+        lines.append("**Requirement:** configuration must pass `terraform validate`")
+        lines.append(f"**Current state:** {e.get('summary', '')}".rstrip())
+        if e.get("detail"):
+            lines.append(f"**Required fix:** {e['detail']}")
+        lines.append("")
+    return "\n".join(lines)
 
 
 _INCLUDE_EXTENSIONS = {

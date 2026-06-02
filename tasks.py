@@ -7,6 +7,7 @@ prior tasks as context, so outputs flow downstream in handoff order.
 """
 
 from crewai import Task
+from tools import build_resource_manifest
 
 
 def build_tasks(architect, specialist_agents, auditor, project_request,
@@ -61,6 +62,26 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
     # --- 1. Architect designs the overall solution first (optional) ---
     # Skipped for simple requests (architect is None); the specialists then work
     # directly from the project request, saving a full design-brief generation.
+    # Manifest of resources that already exist on disk (incremental / extend runs).
+    # Injected into specialist prompts so they reference real addresses.
+    existing_manifest = build_resource_manifest(existing_context or "")
+
+    # Coordination mandate: when an architect runs (3+ specialists), it is the
+    # single point that sees the whole design, so make it pin down the exact
+    # cross-tier wiring the specialists must implement.
+    coordination_mandate = (
+        "\n\nCOORDINATION (critical): for each component, name the EXACT Terraform "
+        "resource addresses (e.g. `aws_s3_bucket.app_logs`) that other tiers will "
+        "reference, and explicitly list every glue resource one component needs to "
+        "access another — IAM roles/policies, instance profiles, security-group rules, "
+        "etc. — and which specialist owns it. Specialists implement exactly these "
+        "addresses; do not leave cross-resource access unspecified.\n"
+        "DATA SOURCE OWNERSHIP: also specify which specialist owns each shared Terraform "
+        "data source (e.g. `data.aws_caller_identity.current`, `data.aws_region.current`, "
+        "`data.aws_availability_zones.available`). Only that specialist emits the data "
+        "block; all others reference it as `data.<type>.<name>` without re-declaring it."
+    )
+
     all_tasks = []
     prior_tasks = []
     architect_task = None
@@ -73,19 +94,22 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
                 "the project request. Preserve every existing resource — only add or modify "
                 "what the request requires. If audit findings are present, address each one "
                 "as a hard requirement. Include what changes, what stays the same, and why."
+                + coordination_mandate
             )
         else:
             architect_description = (
                 f"Project request:\n{project_request}\n\n"
                 "Produce a clear high-level design brief that specialists can implement. "
                 "Include the components needed, how they connect, and any constraints."
+                + coordination_mandate
             )
 
         architect_task = Task(
             description=architect_description,
             expected_output=(
                 "A concise high-level architecture brief (no code) covering components, "
-                "data flow, and constraints. Keep it under ~400 words."
+                "data flow, constraints, and the exact resource addresses + glue resources "
+                "each specialist must create. Keep it under ~450 words."
             ),
             agent=architect
         )
@@ -100,12 +124,23 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
     for specialist_id, specialist in specialist_agents:
         specialist_context = [t for t in (architect_task, last_specialist_task) if t is not None]
 
+        manifest_block = (
+            f"\n\nResources already defined in this project — reference these by their EXACT "
+            f"address and do NOT redefine them:\n{existing_manifest}\n"
+            if existing_manifest else ""
+        )
+
         specialist_task = Task(
             description=(
                 f"You are the {specialist.role}. Implement your specific piece of the project.\n"
-                f"Original request: {project_request}\n\n"
+                f"Original request: {project_request}\n"
+                f"{manifest_block}\n"
                 "Review the architect's brief and any prior specialist output in your context, "
                 "then produce your specific contribution. Build on prior outputs rather than redesigning them.\n\n"
+                "WIRING: If your component must access or be accessed by another resource, create the "
+                "necessary glue (IAM roles/policies, security-group rules, etc.) and reference other "
+                "resources by their EXACT address (as given in the design brief or the manifest above) — "
+                "never invent or guess resource names.\n\n"
                 "IMPORTANT: Be concise and structured. Output ONLY the essential code and configuration — "
                 "no lengthy explanations, no preamble, no commentary. "
                 "Label each file clearly as:\n"
@@ -114,7 +149,13 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
                 f"NAMING: If writing Terraform, name your primary file `{specialist_id}.tf` "
                 f"(not `main.tf`) so each specialist's output stays separate and nothing is overwritten.\n"
                 "Do NOT emit variables.tf or outputs.tf — those are generated automatically "
-                "from your resource files. Only emit your resource file."
+                "from your resource files. Only emit your resource file.\n"
+                "SHARED DATA SOURCES: if you need data sources that other specialists also "
+                "use (e.g. aws_caller_identity, aws_region, aws_availability_zones), define "
+                "them ONLY if you are certain no other specialist in this project will also "
+                "define them. Prefer referencing them via a variable or output instead of "
+                "repeating the data block. When in doubt, leave them out — the architect's "
+                "brief will indicate which specialist owns each shared data source."
             ),
             expected_output=(
                 f"Concise {specialist_id} implementation with each file labelled as "
