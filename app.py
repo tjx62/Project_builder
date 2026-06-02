@@ -20,7 +20,7 @@ from crewai.events.types.llm_events import LLMCallCompletedEvent
 from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS
 from planner import plan_specialists
 from agents import SupportingAgents
-from tasks import build_tasks, build_remediation_tasks
+from tasks import build_tasks, build_remediation_tasks, build_wiring_review_task
 from tools import (
     commit_audited_output, read_workspace_context, write_findings,
     parse_finding_files, read_specific_files,
@@ -405,16 +405,14 @@ with st.sidebar:
 # LLM TIERS — three models, each matched to the complexity of its role.
 #
 #   Haiku   → planner (classification only, fast and cheap)
-#   Sonnet  → specialists (core implementation work)
-#   Opus    → architect + auditor (high-stakes reasoning and compliance review)
+#   Sonnet  → specialists + wiring reviewer (implementation, instruction-following)
+#   Opus    → architect + auditors (high-stakes reasoning and compliance review)
 #
 # To change which tier a role uses, swap the llm argument when that agent
 # is instantiated in Phase 3 below. No other files need to change.
 # ==========================================
 api_key = os.environ.get("ANTHROPIC_API_KEY")
 
-# max_tokens caps each agent's individual response so specialist outputs
-# don't balloon and overflow the manager's context window when accumulated.
 haiku_llm = LLM(
     model="anthropic/claude-haiku-4-5",
     api_key=api_key,
@@ -426,14 +424,14 @@ sonnet_llm = LLM(
     model="anthropic/claude-sonnet-4-6",
     api_key=api_key,
     temperature=0.2,
-    max_tokens=6144
+    max_tokens=8192
 )
 
 opus_llm = LLM(
-    model="anthropic/claude-haiku-4-5",
+    model="anthropic/claude-opus-4-8",
     api_key=api_key,
     temperature=0.2,
-    max_tokens=4096
+    max_tokens=8192
 )
 
 
@@ -633,7 +631,8 @@ elif st.session_state.phase == "execute":
     # script every polling tick.
     if not st.session_state.pipeline_running:
         context_text     = st.session_state.context_text
-        support_haiku    = SupportingAgents(haiku_llm, additional_context=context_text)
+        support_opus     = SupportingAgents(opus_llm,   additional_context=context_text)
+        support_sonnet   = SupportingAgents(sonnet_llm, additional_context=context_text)
         framework_name   = st.session_state.compliance_framework
         key_controls     = COMPLIANCE_FRAMEWORKS.get(framework_name) or ""
         is_audit_only    = st.session_state.audit_only
@@ -641,23 +640,21 @@ elif st.session_state.phase == "execute":
         existing_file_count = existing_context.count("### File:") if existing_context else 0
         st.session_state._existing_file_count = existing_file_count
 
-        auditor_llm = LLM(
-            model="anthropic/claude-haiku-4-5",
-            api_key=api_key,
-            temperature=0.2,
-            max_tokens=8192,
-        )
+        # Auditors run on Opus (compliance reasoning is the highest-stakes step).
+        # The remediation fixer and wiring reviewer run on Sonnet (implementation work).
+        auditor_llm  = opus_llm
+        reviewer_llm = sonnet_llm
 
         is_auto_iterate = st.session_state.auto_iterate
         max_rounds      = st.session_state.max_rounds
 
         if is_audit_only:
             # ── Audit-only: Auditor → Write Findings ───────────────────────
-            auditor = support_haiku.compliance_auditor(
+            auditor = support_opus.compliance_auditor(
                 framework=framework_name, key_controls=key_controls,
                 llm_override=auditor_llm, report_only=True,
             )
-            pipeline     = [("Auditor", "Haiku", auditor), ("Write Findings", "Python", None)]
+            pipeline     = [("Auditor", "Opus", auditor), ("Write Findings", "Python", None)]
             findings_idx = 1
             crew_agents  = [auditor]
             tasks = build_tasks(
@@ -670,35 +667,39 @@ elif st.session_state.phase == "execute":
         elif is_auto_iterate:
             # ── Auto-iterate: crew + tasks built fresh each round inside thread ──
             specialist_agents = [
-                (sid, SPECIALISTS[sid](haiku_llm, additional_context=context_text))
+                (sid, SPECIALISTS[sid](sonnet_llm, additional_context=context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
-            architect    = support_haiku.architect() if use_architect else None
-            # Inline auditor applies fixes during the round-1 full pass; the
-            # remediation engineer handles targeted fixes in rounds 2+; the
-            # report auditor verifies compliance after each round.
-            inline_auditor = support_haiku.compliance_auditor(
+            architect    = support_opus.architect() if use_architect else None
+            # Inline auditor applies compliance fixes during round-1 full pass.
+            # Report auditor verifies compliance after each round.
+            # Fixer applies targeted fixes in rounds 2+.
+            # Wiring reviewer checks cross-resource references after generation.
+            inline_auditor = support_opus.compliance_auditor(
                 framework=framework_name, key_controls=key_controls,
                 llm_override=auditor_llm, report_only=False,
             )
-            report_auditor = support_haiku.compliance_auditor(
+            report_auditor = support_opus.compliance_auditor(
                 framework=framework_name, key_controls=key_controls,
                 llm_override=auditor_llm, report_only=True,
             )
-            fixer = support_haiku.remediation_engineer(
+            fixer = support_sonnet.remediation_engineer(
                 framework=framework_name, key_controls=key_controls,
-                llm_override=auditor_llm,
+                llm_override=reviewer_llm,
             )
+            wiring_reviewer = support_sonnet.wiring_reviewer(llm_override=reviewer_llm)
             generate_crew_agents = (
                 ([architect] if architect else [])
                 + [agent for _, agent in specialist_agents]
                 + [inline_auditor]
+                + [wiring_reviewer]
             )
             pipeline = (
-                ([("Architect", "Haiku", architect)] if architect else [])
-                + [(sid.upper(), "Haiku", agent) for sid, agent in specialist_agents]
-                + [("Auditor", "Haiku", inline_auditor)]
+                ([("Architect", "Opus", architect)] if architect else [])
+                + [(sid.upper(), "Sonnet", agent) for sid, agent in specialist_agents]
+                + [("Auditor", "Opus", inline_auditor)]
+                + [("Wiring Review", "Sonnet", wiring_reviewer)]
                 + [("Git", "Python", None)]
             )
             findings_idx = None
@@ -706,24 +707,26 @@ elif st.session_state.phase == "execute":
             tasks        = []  # built inside run_crew each round
 
         else:
-            # ── Normal: (Architect) → Specialists → (Auditor) → Git ──
+            # ── Normal: (Architect) → Specialists → (Auditor) → Wiring Review → Git ──
             specialist_agents = [
-                (sid, SPECIALISTS[sid](haiku_llm, additional_context=context_text))
+                (sid, SPECIALISTS[sid](sonnet_llm, additional_context=context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
-            architect   = support_haiku.architect() if use_architect else None
+            architect   = support_opus.architect() if use_architect else None
             has_auditor = bool(framework_name and framework_name != "None")
-            auditor   = (
-                support_haiku.compliance_auditor(
+            auditor     = (
+                support_opus.compliance_auditor(
                     framework=framework_name, key_controls=key_controls,
                     llm_override=auditor_llm,
                 ) if has_auditor else None
             )
+            wiring_reviewer = support_sonnet.wiring_reviewer(llm_override=reviewer_llm)
             pipeline  = (
-                ([("Architect", "Haiku", architect)] if architect else [])
-                + [(sid.upper(), "Haiku", agent) for sid, agent in specialist_agents]
-                + ([("Auditor",   "Haiku", auditor)]   if has_auditor    else [])
+                ([("Architect",     "Opus",   architect)]       if architect   else [])
+                + [(sid.upper(),    "Sonnet", agent)            for sid, agent in specialist_agents]
+                + ([("Auditor",     "Opus",   auditor)]         if has_auditor else [])
+                + [("Wiring Review","Sonnet", wiring_reviewer)]
                 + [("Git", "Python", None)]
             )
             findings_idx = None
@@ -731,6 +734,7 @@ elif st.session_state.phase == "execute":
                 ([architect] if architect else [])
                 + [agent for _, agent in specialist_agents]
                 + ([auditor]   if has_auditor    else [])
+                + [wiring_reviewer]
             )
             tasks = build_tasks(
                 architect=architect, specialist_agents=specialist_agents, auditor=auditor,
@@ -738,6 +742,7 @@ elif st.session_state.phase == "execute":
                 compliance_framework=framework_name if has_auditor else None,
                 key_controls=key_controls,
                 existing_context=existing_context,
+                wiring_reviewer=wiring_reviewer,
             )
 
         git_step_idx = len(pipeline) - 1
@@ -871,6 +876,7 @@ elif st.session_state.phase == "execute":
                                 compliance_framework=framework_name,
                                 key_controls=key_controls,
                                 existing_context=round_ctx,
+                                wiring_reviewer=wiring_reviewer,
                             )
                             gen_crew = _make_crew(generate_crew_agents, round_tasks)
                             allowed = None

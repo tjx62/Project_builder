@@ -152,6 +152,52 @@ class SupportingAgents:
             max_iter=max_iter,
         )
 
+    def wiring_reviewer(self, llm_override=None):
+        """Post-generation reviewer that enforces Terraform attribute references.
+
+        Runs after all specialists and the compliance auditor on every full-generation
+        pass. Its only job: find every place a cross-resource value (ARN, ID, name,
+        endpoint, etc.) was constructed as a hardcoded string or data-source
+        interpolation when a direct Terraform resource attribute reference
+        (resource_type.resource_name.attribute) is available in the same config,
+        and replace it. Compliance is out of scope — the auditor handles that.
+        """
+        return Agent(
+            role="Terraform Wiring Reviewer",
+            goal=(
+                "Review all Terraform files and fix every cross-resource reference that "
+                "uses a hardcoded string or reconstructed value instead of a direct "
+                "Terraform attribute reference.\n\n"
+                "What to fix:\n"
+                "- Hardcoded ARNs like 'arn:aws:s3:::my-bucket' when aws_s3_bucket.name.arn exists\n"
+                "- Constructed names like 'my-bucket-${var.env}' when aws_s3_bucket.name.id exists\n"
+                "- String interpolations for IDs, endpoints, DNS names, security-group IDs, "
+                "subnet IDs, VPC IDs, KMS key ARNs, role ARNs — wherever the value is produced "
+                "by another resource in the same config\n\n"
+                "What NOT to change:\n"
+                "- Values that are genuinely external (a bucket in another account/region, a "
+                "pre-existing resource not managed here)\n"
+                "- Variables (var.*) that are correct by design\n"
+                "- Compliance controls, encryption settings, or IAM policy structure\n\n"
+                "Output a brief '## Wiring Review' section listing each reference you fixed "
+                "(one bullet: file, what it was, what it became). If nothing needed fixing, "
+                "write 'No wiring issues found.' Then output ONLY the files you changed as "
+                "'### File: <filename>' fenced blocks. Do NOT re-emit unchanged files."
+            ),
+            backstory=_with_context(
+                "You are a Terraform expert who specialises in correctness of resource wiring. "
+                "You know that hardcoded ARNs and reconstructed resource names are a common "
+                "source of drift and misconfiguration — the resource name the developer intended "
+                "and the name that actually gets created can diverge silently. You replace every "
+                "such reference with the direct Terraform attribute that Terraform itself resolves "
+                "at plan time, making dependencies explicit and plan-verifiable.",
+                self.additional_context,
+            ),
+            llm=llm_override or self.llm,
+            allow_delegation=False,
+            max_iter=3,
+        )
+
     def remediation_engineer(self, framework: str = "FedRAMP Rev 5 High",
                              key_controls: str = "", llm_override=None):
         """A surgical fixer for auto-iterate rounds 2+.

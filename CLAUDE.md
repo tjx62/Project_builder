@@ -74,7 +74,7 @@ The crew is assembled dynamically based on confirmed specialists, then kicked of
 
 ### Pipeline Order
 ```
-(Architect →) [Specialist 1] → [Specialist 2] → ... → Auditor → Git (pure Python)
+(Architect →) [Specialist 1] → [Specialist 2] → ... → (Auditor →) Wiring Review → Git (pure Python)
 ```
 The **architect is optional**: it only runs when the request has `ARCHITECT_MIN_SPECIALISTS` (3) or more specialists. For 1–2 specialist requests it's skipped and the specialists work straight from the request, saving a full design-brief generation. There is **no Terraform Assembler agent** — `outputs.tf` and `variables.tf` are generated in pure Python at commit time.
 
@@ -92,17 +92,20 @@ When the user enables auto-iterate, the pipeline loops generate → audit → fi
 ### Integration check — `terraform validate` (`tools.terraform_validate`)
 The compliance auditor checks *compliance*, not *functional wiring* (does an IAM policy actually reference a bucket that exists?). Each auto-iterate round runs `terraform validate` after committing; any errors are rendered as findings (`render_validation_findings`, with `**File:**` lines the fixer's `parse_finding_files` picks up) and folded into the audit text, so the next round's fixer repairs broken references alongside compliance gaps. Convergence requires **both** a clean compliance audit and a clean validate. It uses `-backend=false` (never touches cloud state/credentials) and degrades gracefully: if there are no `.tf` files, terraform isn't installed, or init fails, it skips without blocking. The normal single-pass mode runs it informationally (no fix loop) and surfaces errors as a warning.
 
-### Cross-resource coordination (`tasks.py`)
-To reduce broken wiring at generation time: when an architect runs (3+ specialists) it's given a **coordination mandate** — name the exact resource addresses and the glue resources (IAM roles/policies, SG rules) each specialist must create. Specialists get a **resource manifest** (`tools.build_resource_manifest` — a compact list of existing `type.name` addresses from the workspace) plus a wiring instruction to reference real addresses and create needed glue. `terraform validate` (above) is the deterministic net for whatever still slips through.
+### Cross-resource coordination (`tasks.py`, `agents.py`)
+To reduce broken wiring at generation time: when an architect runs (3+ specialists) it's given a **coordination mandate** — name the exact resource addresses and the glue resources (IAM roles/policies, SG rules) each specialist must create, and assign ownership of shared data sources (`aws_caller_identity`, `aws_region`, etc.) to prevent duplicates. Specialists get a **resource manifest** (`tools.build_resource_manifest` — a compact list of existing `type.name` addresses from the workspace) plus wiring and data-source instructions.
+
+The **wiring reviewer** (`agents.wiring_reviewer`) is the deterministic net for whatever slips through: it runs last on every full-generation pass, checks every cross-resource value (ARN, ID, name, endpoint, etc.) and replaces hardcoded strings or reconstructed interpolations with direct Terraform attribute references. It emits only the files it changed and has full context of all prior task outputs. `terraform validate` (above) then provides the final structural gate.
 
 ### Model Tiers
 | Agent | Model | Reason |
 |---|---|---|
 | Planner | Haiku | Classification only |
-| Architect (optional) | Haiku | Design brief; skipped for <3 specialists |
-| Specialists | Haiku | Implementation |
-| Auditor | Haiku | Compliance review + emits only changed files |
-| Remediation engineer | Haiku | Targeted fixes in auto-iterate rounds 2+ |
+| Architect (optional) | Opus | High-stakes design; skipped for <3 specialists |
+| Specialists | Sonnet | Implementation + instruction-following fidelity |
+| Compliance auditor (inline + report) | Opus | Compliance reasoning is the highest-stakes step |
+| Wiring reviewer | Sonnet | Cross-resource reference correction (implementation) |
+| Remediation engineer | Sonnet | Targeted fixes in auto-iterate rounds 2+ |
 | Git / outputs.tf / variables.tf | — | Pure Python — no LLM |
 
 > **Note:** The `manager()`, `git_specialist()`, and `terraform_assembler()` factories in `agents.py` are kept around in case you want to revert, but nothing currently calls them.
@@ -134,7 +137,7 @@ Specialist 3 context: [architect, specialist_2]   ← NOT specialist_1
 Auditor context:      [all prior tasks]
 ```
 
-The auditor receives all prior tasks because it needs the full picture. The git step is pure Python and reads task outputs directly, not via a context list.
+The auditor and wiring reviewer both receive all prior tasks. The wiring reviewer always runs last (after the auditor if present) so it sees the fully-corrected config. The git step is pure Python and reads task outputs directly, not via a context list.
 
 ### File Output Format
 Specialists and the auditor label each emitted file as:
@@ -153,7 +156,7 @@ The auditor/fixer emits only the files it **changed**. A pure-Python step (`tool
 Output tokens dominate cost (Haiku output $5/M vs input $1/M), so the biggest wins target how much the agents *emit*:
 
 - **Auditor emits only changed files** — it no longer re-emits every file (which paid output-token cost twice per round). Unchanged specialist files flow through the Python commit step untouched.
-- **Architect skipped for simple requests** (<3 specialists) — avoids a full design-brief generation when it isn't needed.
+- **Architect skipped for simple requests** (<3 specialists) — avoids a full design-brief generation when it isn't needed. The wiring reviewer still runs on simple requests.
 - **Incremental auto-iterate** — rounds 2+ rewrite only the files the findings name (single remediation agent) instead of regenerating the whole design.
 - **`outputs.tf` + `variables.tf` generated in pure Python** (`tools.generate_outputs` / `generate_variables`) — deletes the LLM-backed Terraform Assembler agent entirely.
 - `memory=False` on Crew — no cross-session memory embedding

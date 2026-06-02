@@ -10,10 +10,47 @@ from crewai import Task
 from tools import build_resource_manifest
 
 
+def build_wiring_review_task(reviewer, prior_tasks: list) -> Task:
+    """Single task for the wiring reviewer: fix hardcoded cross-resource references.
+
+    Runs after all specialists (and the compliance auditor if present) so the
+    reviewer sees the complete config. It receives all prior task outputs as
+    context and emits only the files it changed.
+    """
+    return Task(
+        description=(
+            "Review every Terraform file produced by the specialists and auditor.\n\n"
+            "For each resource attribute that references another resource in this config "
+            "(ARN, ID, name, endpoint, security-group ID, subnet ID, KMS key ARN, etc.), "
+            "check whether it uses a direct Terraform attribute reference "
+            "(resource_type.resource_name.attribute) or a hardcoded/reconstructed value.\n\n"
+            "Fix every hardcoded or reconstructed value by replacing it with the correct "
+            "Terraform attribute reference. Examples:\n"
+            "  BAD:  Resource = \"arn:aws:s3:::my-bucket/*\"\n"
+            "  GOOD: Resource = \"${aws_s3_bucket.my_bucket.arn}/*\"\n\n"
+            "  BAD:  bucket = \"my-bucket-${data.aws_caller_identity.current.account_id}\"\n"
+            "  GOOD: bucket = aws_s3_bucket.my_bucket.id\n\n"
+            "Do NOT change values that are genuinely external to this config (resources in "
+            "other accounts, pre-existing infrastructure, correctly-scoped variables). "
+            "Do NOT change compliance controls or IAM policy structure.\n\n"
+            "Output a '## Wiring Review' section (one bullet per fix, or 'No wiring issues "
+            "found.' if nothing changed), then ONLY the files you changed as "
+            "'### File: <filename>' fenced blocks."
+        ),
+        expected_output=(
+            "A '## Wiring Review' section followed by only the files that were changed, "
+            "each as '### File: <filename>' with a fenced code block. No unchanged files."
+        ),
+        agent=reviewer,
+        context=list(prior_tasks),
+    )
+
+
 def build_tasks(architect, specialist_agents, auditor, project_request,
                 compliance_framework: str | None = None, key_controls: str = "",
                 existing_context: str | None = None,
-                audit_only: bool = False):
+                audit_only: bool = False,
+                wiring_reviewer=None):
     """Build the full ordered task list for sequential execution.
 
     Args:
@@ -205,6 +242,15 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
             context=list(prior_tasks),
         )
         all_tasks.append(audit_task)
+        prior_tasks.append(audit_task)
+
+    # --- 4. Wiring reviewer (optional) ---
+    # Runs last, after the auditor (or after specialists if no auditor), so it
+    # sees the final corrected config. Checks that every cross-resource reference
+    # uses a Terraform attribute reference, not a hardcoded/reconstructed value.
+    if wiring_reviewer is not None:
+        wiring_task = build_wiring_review_task(wiring_reviewer, prior_tasks)
+        all_tasks.append(wiring_task)
 
     return all_tasks
 
