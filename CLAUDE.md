@@ -292,3 +292,129 @@ git init
 3. **Additional specialists** — add to `specialists.py` following the existing pattern. Set its `SPECIALIST_PRODUCES_TERRAFORM` flag; no other files need changing.
 4. **Remediation prompt adherence** — the fixer occasionally emits files it wasn't asked to touch; the `allowed_files` commit filter discards them, but tightening the prompt could save tokens.
 5. **`generate_outputs` coverage** — it emits `id` only for AWS resource types not in `_OUTPUT_ATTRS`; extend the map for richer outputs on more resource types.
+6. **Requirements/Synthesis refactor** — see the full design in "Proposed Architecture" below. High-value planned change; implement in the phased order listed there.
+
+---
+
+## Proposed Architecture: Requirements/Synthesis Split (NOT YET IMPLEMENTED)
+
+Planned refactor to separate "what to build" (AWS domain expertise) from "how to express
+it in IaC" (Terraform authoring). Capture of a design discussion — implement in phases,
+do not attempt all at once.
+
+### The Core Idea
+
+Currently each AWS specialist does double duty: domain expert AND Terraform author. This
+causes inconsistent HCL between specialists (different naming, structure, tagging, module
+conventions). The fix is to split these responsibilities cleanly.
+
+**New flow:**
+```
+Architect (optional, 3+ specialists)
+  → AWS Specialists   (output REQUIREMENT SPECS, not HCL)
+  → Terraform Specialist  (consumes all specs, authors all .tf files)
+  → Verification Loop (specialists verify their requirements are met in the HCL)
+  → Compliance Auditor
+  → Wiring Reviewer
+  → Pure-Python commit
+```
+
+### Why This Is Better
+
+1. **Consistency** — one IaC author means uniform naming, tagging, module structure,
+   and provider config across all resources. Removes a whole class of cross-specialist
+   HCL inconsistencies that the wiring reviewer currently has to clean up.
+2. **Swappable IaC layer** — specialists output requirements, not HCL. Swap the Terraform
+   specialist for CloudFormation, Pulumi, or CDK without touching any AWS domain specialist.
+3. **Simpler specialists** — an IAM specialist outputting "I need a role with these 3
+   permissions scoped to this resource" is more reliable than one writing correct HCL
+   for it, reducing the burden on the wiring reviewer.
+
+### Specialist Output Format Change
+
+Specialists stop outputting `### File:` code blocks. Instead they output structured
+requirement specs:
+
+```
+### Resource: S3 Bucket
+- Name: app-logs-bucket
+- Versioning: enabled
+- Encryption: SSE-KMS with customer-managed key
+- Lifecycle: transition to Glacier after 90 days
+- Access logging: enabled, target = audit-logs-bucket
+- Required IAM permissions: s3:GetObject, s3:PutObject scoped to this bucket ARN
+```
+
+The Terraform specialist consumes ALL specs and produces one coherent set of `.tf` files
+using the `### File:` format the existing commit step already expects. No change needed
+to the commit logic.
+
+### Verification Loop
+
+Because each AWS specialist defined its own requirements, it is the right agent to verify
+the Terraform specialist actually satisfied them. This mirrors the existing auditor
+kick-back pattern but applied one layer earlier and with a hard iteration cap.
+
+**Loop design:**
+```
+Terraform Specialist drafts HCL
+  → Each AWS Specialist verifies its own requirements are met in the HCL
+     → PASS: proceed to Auditor
+     → FAIL: return specific findings to Terraform Specialist for targeted fixes
+  → Repeat up to MAX_VERIFY_ROUNDS (suggested: 2-3)
+  → If still failing after cap: surface findings to user and proceed anyway
+```
+
+**Key implementation notes:**
+- Each specialist must verify against its **own original spec** (not re-derived from
+  scratch) — pass the spec back as context during verification. Otherwise specialists
+  can drift and reject valid Terraform for the wrong reasons.
+- The verification loop has its own token cost: each cycle is another Terraform author
+  + N specialist verifier LLM calls. The `max_iter` caps on agents help but the loop
+  itself needs a hard ceiling.
+- The existing `terraform validate` step still provides the final structural gate after
+  the loop. Both clean verification AND clean validate required for convergence.
+
+### How This Relates to Existing Code
+
+The wiring reviewer (`agents.wiring_reviewer`) already handles cross-resource reference
+correction post-generation. With this refactor, wiring issues should be rarer because
+one author produces the whole HCL. The wiring reviewer stays as a safety net but should
+have less to do.
+
+The auto-iterate loop (remediation engineer) stays unchanged — it handles compliance
+issues, not IaC authoring consistency.
+
+### Two-Crew Parallelization (FUTURE — lower priority)
+
+Discussed but deliberately deferred. The idea: one crew of AWS specialists drafting
+requirements in parallel, a second crew of Terraform specialists parallelizing the
+authoring by resource group.
+
+**Why deferred:**
+- Adds a second manager agent, significantly increasing orchestration cost.
+- Terraform resources often have dependencies (EC2 module references VPC subnet IDs),
+  so naive parallelization produces code that doesn't wire together. Needs
+  dependency-aware task splitting, which is non-trivial.
+- Should not be attempted until the single-pipeline requirements/synthesis version is
+  stable and well-tested.
+
+**Middle ground if throughput becomes an issue:** keep one crew but treat it as two
+clear internal phases (requirements gathering, then synthesis) rather than spinning up
+a second crew.
+
+### Recommended Implementation Order
+
+1. Update `specialists.py` — add a `produces_terraform` flag (already exists as
+   `SPECIALIST_PRODUCES_TERRAFORM`); set it to `False` for all AWS specialists.
+   Update specialist goals/backstories to output requirement specs instead of HCL.
+2. Add a `terraform_specialist` factory to `specialists.py` and register it in
+   `SPECIALISTS`. This agent's job is to read all requirement specs and author
+   one coherent set of `.tf` files.
+3. Update `tasks.py` — add the Terraform specialist task after all AWS specialist
+   tasks, before the auditor.
+4. Add the verification loop in `tasks.py` with a `MAX_VERIFY_ROUNDS` cap.
+5. Verify that the existing wiring reviewer and `terraform validate` steps still work
+   correctly with the new flow (they should — the `### File:` format is unchanged).
+6. Test on simple single-specialist requests first, then multi-specialist.
+7. Only consider two-crew parallelization after this is stable.
