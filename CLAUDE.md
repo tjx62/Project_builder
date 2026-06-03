@@ -29,19 +29,34 @@ poetry add "crewai[anthropic]"   # required for native Anthropic provider
 poetry add python-dotenv boto3
 ```
 
-### `.env` file
+### `.env` file — Anthropic direct (default)
 ```
 ANTHROPIC_API_KEY=sk-ant-...
-MODEL=anthropic/claude-haiku-4-5   # CrewAI's internal default model
+MODEL=anthropic/claude-haiku-4-5-20251001   # CrewAI's internal default model
 CREWAI_LLM_PROVIDER=anthropic
 OPENAI_API_KEY=not-used            # Suppresses CrewAI's OpenAI fallback
 CREWAI_TELEMETRY_OPT_OUT=true
 PROJECT_WORKSPACE_DIR=.
-
-# AWS Bedrock (not active yet — waiting on billing resolution)
-# AWS_BEARER_TOKEN_BEDROCK=...
-# AWS_DEFAULT_REGION=us-east-1
 ```
+
+### `.env` file — AWS Bedrock via SSO
+```
+LLM_PROVIDER=bedrock
+AWS_PROFILE=your-sso-profile-name  # the profile you use with `aws sso login`
+AWS_DEFAULT_REGION=us-east-1
+
+# Still needed to suppress CrewAI's OpenAI fallback
+OPENAI_API_KEY=not-used
+CREWAI_TELEMETRY_OPT_OUT=true
+PROJECT_WORKSPACE_DIR=.
+```
+
+Before starting the app with Bedrock: `aws sso login --profile your-sso-profile-name`
+
+The app will inject `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_SESSION_TOKEN`
+at startup and before each pipeline run (boto3 handles SSO token refresh automatically).
+A "Refresh AWS Credentials" button in the sidebar lets you re-resolve credentials without
+restarting if your SSO session expires mid-session.
 
 ---
 
@@ -192,13 +207,17 @@ crewai_event_bus.off(AgentExecutionCompletedEvent, on_agent_completed)
 - `task_callback`: In hierarchical mode always fires with manager role only.
 - `step_callback`: LangChain-era feature; not called by the native Anthropic provider.
 
-### 2. AWS Bedrock access (BLOCKED externally)
+### 2. AWS Bedrock access (BLOCKED externally — implementation ready)
 
-Bedrock access is configured but blocked due to an AWS billing issue. The app is currently running against the Anthropic API directly. When Bedrock is unblocked:
+Bedrock support is fully wired (`LLM_PROVIDER=bedrock` in `.env`). It is currently
+blocked due to an AWS billing issue. Once billing is resolved:
 
-- Update `.env` to use `AWS_BEARER_TOKEN_BEDROCK` and `AWS_DEFAULT_REGION`
-- Update model strings from `anthropic/claude-haiku-4-5` to `bedrock/us.anthropic.claude-haiku-4-5` etc.
-- The `AWS_CONFIG_FILE=~/.aws/config-bedrock` approach was chosen to avoid touching the existing `~/.aws/config`
+1. Set `LLM_PROVIDER=bedrock` and `AWS_PROFILE=<sso-profile>` in `.env`.
+2. Run `aws sso login --profile <sso-profile>`.
+3. Start the app — it will inject credentials automatically.
+
+Model strings are managed in `_BEDROCK_MODEL_IDS` at the top of `app.py`; no other
+files need to change when switching providers.
 
 ---
 

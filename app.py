@@ -34,6 +34,67 @@ ARCHITECT_MIN_SPECIALISTS = 3
 load_dotenv()
 
 # ==========================================
+# PROVIDER CONFIG — Anthropic direct or AWS Bedrock via SSO
+# ==========================================
+# Set LLM_PROVIDER=bedrock in .env to route all LLM calls through AWS Bedrock.
+# For SSO, set AWS_PROFILE to the profile you use with `aws sso login`.
+_LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+_USE_BEDROCK  = _LLM_PROVIDER == "bedrock"
+_AWS_PROFILE  = os.environ.get("AWS_PROFILE") or None
+_AWS_REGION   = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+
+_BEDROCK_MODEL_IDS = {
+    "haiku":  "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "sonnet": "bedrock/us.anthropic.claude-sonnet-4-6",
+    "opus":   "bedrock/us.anthropic.claude-opus-4-8",
+}
+_ANTHROPIC_MODEL_IDS = {
+    "haiku":  "anthropic/claude-haiku-4-5-20251001",
+    "sonnet": "anthropic/claude-sonnet-4-6",
+    "opus":   "anthropic/claude-opus-4-7",
+}
+
+# Default tier assigned to each pipeline role.
+# To add a new model tier: add its entry to _BEDROCK_MODEL_IDS / _ANTHROPIC_MODEL_IDS above,
+# then add it to the _tier_options list in the sidebar expander below.
+_DEFAULT_MODEL_ASSIGNMENTS: dict[str, str] = {
+    "planner":         "haiku",
+    "architect":       "opus",
+    "specialist":      "sonnet",
+    "auditor":         "opus",
+    "wiring_reviewer": "sonnet",
+    "remediation":     "sonnet",
+}
+
+
+def _inject_bedrock_credentials() -> None:
+    """Resolve credentials via boto3 (handles SSO refresh) and export for LiteLLM.
+
+    Call this before each pipeline run so STS session tokens stay fresh.
+    If the underlying SSO session has expired, boto3 raises — the caller should
+    surface that error and prompt the user to run `aws sso login` again.
+    """
+    import boto3  # noqa: PLC0415
+    session = boto3.Session(profile_name=_AWS_PROFILE, region_name=_AWS_REGION)
+    creds = session.get_credentials()
+    if creds is None:
+        hint = (
+            f"Run `aws sso login --profile {_AWS_PROFILE}`."
+            if _AWS_PROFILE
+            else "Configure AWS credentials or set AWS_PROFILE in .env."
+        )
+        raise RuntimeError(f"No AWS credentials found. {hint}")
+    frozen = creds.get_frozen_credentials()
+    os.environ["AWS_ACCESS_KEY_ID"]     = frozen.access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
+    os.environ["AWS_DEFAULT_REGION"]    = _AWS_REGION
+    if frozen.token:
+        os.environ["AWS_SESSION_TOKEN"] = frozen.token
+    elif "AWS_SESSION_TOKEN" in os.environ:
+        del os.environ["AWS_SESSION_TOKEN"]  # clear a stale token from a previous session
+
+
+# ==========================================
 # 1. STREAMLIT CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Adaptive Code Builder", page_icon="🏗️", layout="wide")
@@ -296,6 +357,8 @@ if "auto_iterate" not in st.session_state:
     st.session_state.auto_iterate = False
 if "max_rounds" not in st.session_state:
     st.session_state.max_rounds = 3
+if "model_assignments" not in st.session_state:
+    st.session_state.model_assignments = dict(_DEFAULT_MODEL_ASSIGNMENTS)
 
 
 def _interrupt_pipeline_thread():
@@ -321,7 +384,7 @@ def reset():
     st.session_state.pipeline_error = None
     for key in (
         "pipeline_thread", "pipeline_queue", "pipeline_result_holder",
-        "pipeline_labels", "active_index", "pipeline_completed",
+        "pipeline_labels", "pipeline_cards", "active_index", "pipeline_completed",
         "activity_log", "step_count",
         "tokens", "pipeline_start_time", "pipeline_end_time",
         "git_result", "_existing_file_count", "findings_result", "auto_iterate_result",
@@ -396,6 +459,54 @@ with st.sidebar:
         st.success("Context loaded.")
 
     st.divider()
+    # Model assignment controls.
+    # _tier_options lists every available tier in display order.
+    # To expose a new model tier here: add it to _BEDROCK_MODEL_IDS / _ANTHROPIC_MODEL_IDS
+    # and append its key to this list.
+    _tier_options = ["haiku", "sonnet", "opus"]
+    _role_labels = {
+        "planner":         "Planner",
+        "architect":       "Architect",
+        "specialist":      "Specialists",
+        "auditor":         "Auditor",
+        "wiring_reviewer": "Wiring Reviewer",
+        "remediation":     "Remediation Eng.",
+    }
+    with st.expander("🤖 Model Assignments", expanded=False):
+        ma = st.session_state.model_assignments
+        for role_key, role_label in _role_labels.items():
+            current = ma.get(role_key, _DEFAULT_MODEL_ASSIGNMENTS[role_key])
+            chosen = st.selectbox(
+                role_label,
+                options=_tier_options,
+                index=_tier_options.index(current) if current in _tier_options else 0,
+                key=f"ma_{role_key}",
+            )
+            ma[role_key] = chosen
+        if st.button("Reset to defaults", key="ma_reset", use_container_width=True):
+            st.session_state.model_assignments = dict(_DEFAULT_MODEL_ASSIGNMENTS)
+            st.rerun()
+
+    st.divider()
+    st.markdown("**LLM Provider**")
+    if _USE_BEDROCK:
+        _profile_label = f"Profile: `{_AWS_PROFILE}`" if _AWS_PROFILE else "Default profile"
+        st.info(f"🟠 Bedrock — {_profile_label}\nRegion: `{_AWS_REGION}`")
+        if st.button("🔑 Refresh AWS Credentials", use_container_width=True,
+                     help="Re-run if your SSO session has expired."):
+            try:
+                _inject_bedrock_credentials()
+                st.success("Credentials refreshed.")
+            except Exception as _e:
+                profile_hint = (
+                    f"Run `aws sso login --profile {_AWS_PROFILE}` in your terminal."
+                    if _AWS_PROFILE else "Run `aws sso login` in your terminal."
+                )
+                st.error(f"{_e}\n\n{profile_hint}")
+    else:
+        st.info("🟣 Anthropic direct API")
+
+    st.divider()
     if st.button("🔄 Start Over"):
         reset()
         st.rerun()
@@ -408,31 +519,36 @@ with st.sidebar:
 #   Sonnet  → specialists + wiring reviewer (implementation, instruction-following)
 #   Opus    → architect + auditors (high-stakes reasoning and compliance review)
 #
+# Model strings and kwargs adapt automatically based on LLM_PROVIDER in .env.
 # To change which tier a role uses, swap the llm argument when that agent
 # is instantiated in Phase 3 below. No other files need to change.
 # ==========================================
-api_key = os.environ.get("ANTHROPIC_API_KEY")
+_model_ids = _BEDROCK_MODEL_IDS if _USE_BEDROCK else _ANTHROPIC_MODEL_IDS
+_api_key   = None if _USE_BEDROCK else os.environ.get("ANTHROPIC_API_KEY")
 
-haiku_llm = LLM(
-    model="anthropic/claude-haiku-4-5",
-    api_key=api_key,
-    temperature=0.2,
-    max_tokens=8192
-)
+# For Bedrock, LiteLLM reads AWS_* env vars injected by _inject_bedrock_credentials().
+# No api_key argument is needed; passing one causes LiteLLM to treat it as Anthropic direct.
+_llm_kwargs = {"temperature": 0.2, "max_tokens": 8192}
+if not _USE_BEDROCK:
+    _llm_kwargs["api_key"] = _api_key
 
-sonnet_llm = LLM(
-    model="anthropic/claude-sonnet-4-6",
-    api_key=api_key,
-    temperature=0.2,
-    max_tokens=8192
-)
+haiku_llm  = LLM(model=_model_ids["haiku"],  **_llm_kwargs)
+sonnet_llm = LLM(model=_model_ids["sonnet"], **_llm_kwargs)
+opus_llm   = LLM(model=_model_ids["opus"],   **_llm_kwargs)
 
-opus_llm = LLM(
-    model="anthropic/claude-opus-4-8",
-    api_key=api_key,
-    temperature=0.2,
-    max_tokens=8192
-)
+_TIER_LLMS = {"haiku": haiku_llm, "sonnet": sonnet_llm, "opus": opus_llm}
+_TIER_COLORS = {"haiku": "#10B981", "sonnet": "#6366F1", "opus": "#F59E0B"}
+_TIER_ICONS  = {"haiku": "🟢", "sonnet": "🟣", "opus": "🟠"}
+
+
+def _llm_for(role_key: str) -> LLM:
+    """Return the LLM instance assigned to a pipeline role via the sidebar."""
+    tier = st.session_state.model_assignments.get(role_key, _DEFAULT_MODEL_ASSIGNMENTS[role_key])
+    return _TIER_LLMS.get(tier, haiku_llm)
+
+
+def _tier_for(role_key: str) -> str:
+    return st.session_state.model_assignments.get(role_key, _DEFAULT_MODEL_ASSIGNMENTS[role_key])
 
 
 # ==========================================
@@ -451,10 +567,28 @@ if st.session_state.phase == "input":
         value=st.session_state.project_request,
     )
 
+    def _check_credentials() -> str | None:
+        """Return an error string if credentials are missing, else None."""
+        if _USE_BEDROCK:
+            try:
+                _inject_bedrock_credentials()
+            except Exception as exc:
+                profile_hint = (
+                    f"Run `aws sso login --profile {_AWS_PROFILE}` and reload the page."
+                    if _AWS_PROFILE else
+                    "Run `aws sso login` and reload the page, or set AWS_PROFILE in .env."
+                )
+                return f"Bedrock credential error: {exc}\n{profile_hint}"
+        else:
+            if not _api_key:
+                return "ANTHROPIC_API_KEY is missing from your .env file."
+        return None
+
     if _audit_mode:
         if st.button("🔍 Run Audit", type="primary"):
-            if not api_key:
-                st.error("ANTHROPIC_API_KEY is missing from your .env file.")
+            cred_err = _check_credentials()
+            if cred_err:
+                st.error(cred_err)
             else:
                 _ctx = read_workspace_context(st.session_state.project_path)
                 if not _ctx:
@@ -467,20 +601,22 @@ if st.session_state.phase == "input":
         if st.button("🧭 Plan Specialists", type="primary"):
             if not st.session_state.project_request.strip():
                 st.error("Please describe the project first.")
-            elif not api_key:
-                st.error("ANTHROPIC_API_KEY is missing from your .env file.")
             else:
-                with st.spinner("Planner is analyzing the request..."):
-                    try:
-                        st.session_state.plan = plan_specialists(
-                            llm=haiku_llm,
-                            project_request=st.session_state.project_request,
-                            additional_context=st.session_state.context_text
-                        )
-                        st.session_state.phase = "confirm"
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Planner failed: {e}")
+                cred_err = _check_credentials()
+                if cred_err:
+                    st.error(cred_err)
+                else:
+                    with st.spinner("Planner is analyzing the request..."):
+                        try:
+                            st.session_state.plan = plan_specialists(
+                                llm=_llm_for("planner"),
+                                project_request=st.session_state.project_request,
+                                additional_context=st.session_state.context_text
+                            )
+                            st.session_state.phase = "confirm"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Planner failed: {e}")
 
 
 # ==========================================
@@ -630,9 +766,13 @@ elif st.session_state.phase == "execute":
     # runs exactly once per pipeline execution even as Streamlit reruns the
     # script every polling tick.
     if not st.session_state.pipeline_running:
+        if _USE_BEDROCK:
+            try:
+                _inject_bedrock_credentials()
+            except Exception as _cred_exc:
+                st.error(str(_cred_exc))
+                st.stop()
         context_text     = st.session_state.context_text
-        support_opus     = SupportingAgents(opus_llm,   additional_context=context_text)
-        support_sonnet   = SupportingAgents(sonnet_llm, additional_context=context_text)
         framework_name   = st.session_state.compliance_framework
         key_controls     = COMPLIANCE_FRAMEWORKS.get(framework_name) or ""
         is_audit_only    = st.session_state.audit_only
@@ -640,21 +780,25 @@ elif st.session_state.phase == "execute":
         existing_file_count = existing_context.count("### File:") if existing_context else 0
         st.session_state._existing_file_count = existing_file_count
 
-        # Auditors run on Opus (compliance reasoning is the highest-stakes step).
-        # The remediation fixer and wiring reviewer run on Sonnet (implementation work).
-        auditor_llm  = opus_llm
-        reviewer_llm = sonnet_llm
+        auditor_llm  = _llm_for("auditor")
+        reviewer_llm = _llm_for("wiring_reviewer")
+        architect_llm = _llm_for("architect")
+
+        support_architect = SupportingAgents(architect_llm, additional_context=context_text)
+        support_auditor   = SupportingAgents(auditor_llm,   additional_context=context_text)
+        support_reviewer  = SupportingAgents(reviewer_llm,  additional_context=context_text)
+        support_remediation = SupportingAgents(_llm_for("remediation"), additional_context=context_text)
 
         is_auto_iterate = st.session_state.auto_iterate
         max_rounds      = st.session_state.max_rounds
 
         if is_audit_only:
             # ── Audit-only: Auditor → Write Findings ───────────────────────
-            auditor = support_opus.compliance_auditor(
+            auditor = support_auditor.compliance_auditor(
                 framework=framework_name, key_controls=key_controls,
                 llm_override=auditor_llm, report_only=True,
             )
-            pipeline     = [("Auditor", "Opus", auditor), ("Write Findings", "Python", None)]
+            pipeline     = [("Auditor", "auditor", auditor), ("Write Findings", "python", None)]
             findings_idx = 1
             crew_agents  = [auditor]
             tasks = build_tasks(
@@ -667,28 +811,28 @@ elif st.session_state.phase == "execute":
         elif is_auto_iterate:
             # ── Auto-iterate: crew + tasks built fresh each round inside thread ──
             specialist_agents = [
-                (sid, SPECIALISTS[sid](sonnet_llm, additional_context=context_text))
+                (sid, SPECIALISTS[sid](_llm_for("specialist"), additional_context=context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
-            architect    = support_opus.architect() if use_architect else None
+            architect    = support_architect.architect() if use_architect else None
             # Inline auditor applies compliance fixes during round-1 full pass.
             # Report auditor verifies compliance after each round.
             # Fixer applies targeted fixes in rounds 2+.
             # Wiring reviewer checks cross-resource references after generation.
-            inline_auditor = support_opus.compliance_auditor(
+            inline_auditor = support_auditor.compliance_auditor(
                 framework=framework_name, key_controls=key_controls,
                 llm_override=auditor_llm, report_only=False,
             )
-            report_auditor = support_opus.compliance_auditor(
+            report_auditor = support_auditor.compliance_auditor(
                 framework=framework_name, key_controls=key_controls,
                 llm_override=auditor_llm, report_only=True,
             )
-            fixer = support_sonnet.remediation_engineer(
+            fixer = support_remediation.remediation_engineer(
                 framework=framework_name, key_controls=key_controls,
-                llm_override=reviewer_llm,
+                llm_override=_llm_for("remediation"),
             )
-            wiring_reviewer = support_sonnet.wiring_reviewer(llm_override=reviewer_llm)
+            wiring_reviewer = support_reviewer.wiring_reviewer(llm_override=reviewer_llm)
             generate_crew_agents = (
                 ([architect] if architect else [])
                 + [agent for _, agent in specialist_agents]
@@ -696,11 +840,11 @@ elif st.session_state.phase == "execute":
                 + [wiring_reviewer]
             )
             pipeline = (
-                ([("Architect", "Opus", architect)] if architect else [])
-                + [(sid.upper(), "Sonnet", agent) for sid, agent in specialist_agents]
-                + [("Auditor", "Opus", inline_auditor)]
-                + [("Wiring Review", "Sonnet", wiring_reviewer)]
-                + [("Git", "Python", None)]
+                ([("Architect", "architect", architect)] if architect else [])
+                + [(sid.upper(), "specialist", agent) for sid, agent in specialist_agents]
+                + [("Auditor", "auditor", inline_auditor)]
+                + [("Wiring Review", "wiring_reviewer", wiring_reviewer)]
+                + [("Git", "python", None)]
             )
             findings_idx = None
             crew_agents  = generate_crew_agents   # for role_to_idx only
@@ -709,25 +853,25 @@ elif st.session_state.phase == "execute":
         else:
             # ── Normal: (Architect) → Specialists → (Auditor) → Wiring Review → Git ──
             specialist_agents = [
-                (sid, SPECIALISTS[sid](sonnet_llm, additional_context=context_text))
+                (sid, SPECIALISTS[sid](_llm_for("specialist"), additional_context=context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
-            architect   = support_opus.architect() if use_architect else None
+            architect   = support_architect.architect() if use_architect else None
             has_auditor = bool(framework_name and framework_name != "None")
             auditor     = (
-                support_opus.compliance_auditor(
+                support_auditor.compliance_auditor(
                     framework=framework_name, key_controls=key_controls,
                     llm_override=auditor_llm,
                 ) if has_auditor else None
             )
-            wiring_reviewer = support_sonnet.wiring_reviewer(llm_override=reviewer_llm)
+            wiring_reviewer = support_reviewer.wiring_reviewer(llm_override=reviewer_llm)
             pipeline  = (
-                ([("Architect",     "Opus",   architect)]       if architect   else [])
-                + [(sid.upper(),    "Sonnet", agent)            for sid, agent in specialist_agents]
-                + ([("Auditor",     "Opus",   auditor)]         if has_auditor else [])
-                + [("Wiring Review","Sonnet", wiring_reviewer)]
-                + [("Git", "Python", None)]
+                ([("Architect",      "architect",      architect)]       if architect   else [])
+                + [(sid.upper(),     "specialist",     agent)            for sid, agent in specialist_agents]
+                + ([("Auditor",      "auditor",        auditor)]         if has_auditor else [])
+                + [("Wiring Review", "wiring_reviewer", wiring_reviewer)]
+                + [("Git",           "python",          None)]
             )
             findings_idx = None
             crew_agents  = (
@@ -988,7 +1132,8 @@ elif st.session_state.phase == "execute":
         st.session_state.pipeline_thread        = thread
         st.session_state.pipeline_queue         = log_queue
         st.session_state.pipeline_result_holder = result_holder
-        st.session_state.pipeline_labels        = [label for label, _tier, _agent in pipeline]
+        st.session_state.pipeline_labels        = [label    for label, _role, _agent in pipeline]
+        st.session_state.pipeline_cards         = [(label, role) for label, role, _agent in pipeline]
         st.session_state.active_index           = -1
         st.session_state.pipeline_completed     = set()
         st.session_state.activity_log           = [
@@ -1008,6 +1153,10 @@ elif st.session_state.phase == "execute":
     log_queue     = st.session_state.pipeline_queue
     result_holder = st.session_state.pipeline_result_holder
     labels        = st.session_state.pipeline_labels
+    # pipeline_cards is (label, role_key) — drives model badges on pipeline cards.
+    # Fall back gracefully if session was started before this field existed.
+    if "pipeline_cards" not in st.session_state:
+        st.session_state.pipeline_cards = [(l, "haiku") for l in labels]
 
     # --- Pipeline card display ---
     st.markdown("### Pipeline")
@@ -1015,20 +1164,25 @@ elif st.session_state.phase == "execute":
     _fw_label  = f"Auditor enforces **{_fw}**." if _fw and _fw != "None" else "No compliance audit."
     _ctx_count = st.session_state.get("_existing_file_count", 0)
     _ctx_label = f"📂 Extending **{_ctx_count}** existing file(s)." if _ctx_count else "✨ New project."
-    st.caption(f"🟢 Agents run in sequence on Haiku. {_fw_label} {_ctx_label}")
+    st.caption(f"{_fw_label} {_ctx_label}")
 
-    MODEL_COLOR = "#10B981"
-    MODEL_LABEL = "anthropic/claude-haiku-4-5"
-
+    # pipeline_cards stores (label, role_key) for each card — role_key drives the model badge.
+    pipeline_cards = st.session_state.get("pipeline_cards", [])
     card_cols = st.columns(len(labels))
-    card_placeholders = [(col.empty(), label) for col, label in zip(card_cols, labels)]
+    card_placeholders = [(col.empty(), label, role_key)
+                         for col, (label, role_key) in zip(card_cols, pipeline_cards)]
 
     def render_cards(active_idx, completed_set):
-        for i, (ph, label) in enumerate(card_placeholders):
+        for i, (ph, label, role_key) in enumerate(card_placeholders):
+            tier       = _tier_for(role_key) if role_key != "python" else None
+            color      = _TIER_COLORS.get(tier, "#555") if tier else "#555"
+            tier_icon  = _TIER_ICONS.get(tier, "⚙️")   if tier else "⚙️"
+            tier_label = tier.title()                     if tier else "Python"
+            model_str  = _model_ids.get(tier, "—")       if tier else "—"
             if i in completed_set:
                 bg, border, icon, opacity = "#0d1f0d", "#22c55e", "✅", "0.9"
             elif i == active_idx:
-                bg, border, icon, opacity = "#0d0d1f", MODEL_COLOR, "⚡", "1.0"
+                bg, border, icon, opacity = "#0d0d1f", color, "⚡", "1.0"
             else:
                 bg, border, icon, opacity = "#111", "#2a2a2a", "·", "0.45"
             ph.markdown(
@@ -1036,8 +1190,8 @@ elif st.session_state.phase == "execute":
                     padding:12px 6px;text-align:center;opacity:{opacity};">
                     <div style="font-size:1.3em;margin-bottom:4px">{icon}</div>
                     <div style="font-weight:700;font-size:0.8em;color:#fff;margin-bottom:2px">{label}</div>
-                    <div style="font-size:0.68em;color:{MODEL_COLOR};font-weight:600">🟢 Haiku</div>
-                    <div style="font-size:0.6em;color:#555;margin-top:2px">{MODEL_LABEL}</div>
+                    <div style="font-size:0.68em;color:{color};font-weight:600">{tier_icon} {tier_label}</div>
+                    <div style="font-size:0.6em;color:#555;margin-top:2px">{model_str}</div>
                 </div>""",
                 unsafe_allow_html=True,
             )
