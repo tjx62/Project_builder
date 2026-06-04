@@ -8,7 +8,6 @@ import queue
 import threading
 import logging
 import time
-from dotenv import load_dotenv
 from crewai import Crew, Process, LLM
 from crewai.events.event_bus import crewai_event_bus
 from crewai.events.types.agent_events import (
@@ -17,6 +16,13 @@ from crewai.events.types.agent_events import (
 )
 from crewai.events.types.llm_events import LLMCallCompletedEvent
 
+from config import (
+    USE_BEDROCK, AWS_PROFILE, AWS_REGION,
+    BEDROCK_MODEL_IDS, ANTHROPIC_MODEL_IDS,
+    TIER_OPTIONS, TIER_COLORS, TIER_ICONS,
+    DEFAULT_MODEL_ASSIGNMENTS, ROLE_LABELS,
+    inject_bedrock_credentials,
+)
 from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS
 from planner import plan_specialists
 from agents import SupportingAgents
@@ -30,68 +36,6 @@ from tools import (
 # Architect runs only for requests with more than this many specialists; simple
 # 1–2 specialist requests skip the design phase to save a full generation.
 ARCHITECT_MIN_SPECIALISTS = 3
-
-load_dotenv()
-
-# ==========================================
-# PROVIDER CONFIG — Anthropic direct or AWS Bedrock via SSO
-# ==========================================
-# Set LLM_PROVIDER=bedrock in .env to route all LLM calls through AWS Bedrock.
-# For SSO, set AWS_PROFILE to the profile you use with `aws sso login`.
-_LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic").lower()
-_USE_BEDROCK  = _LLM_PROVIDER == "bedrock"
-_AWS_PROFILE  = os.environ.get("AWS_PROFILE") or None
-_AWS_REGION   = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
-
-_BEDROCK_MODEL_IDS = {
-    "haiku":  "bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "sonnet": "bedrock/us.anthropic.claude-sonnet-4-6",
-    "opus":   "bedrock/us.anthropic.claude-opus-4-8",
-}
-_ANTHROPIC_MODEL_IDS = {
-    "haiku":  "anthropic/claude-haiku-4-5-20251001",
-    "sonnet": "anthropic/claude-sonnet-4-6",
-    "opus":   "anthropic/claude-opus-4-7",
-}
-
-# Default tier assigned to each pipeline role.
-# To add a new model tier: add its entry to _BEDROCK_MODEL_IDS / _ANTHROPIC_MODEL_IDS above,
-# then add it to the _tier_options list in the sidebar expander below.
-_DEFAULT_MODEL_ASSIGNMENTS: dict[str, str] = {
-    "planner":         "haiku",
-    "architect":       "opus",
-    "specialist":      "sonnet",
-    "auditor":         "opus",
-    "wiring_reviewer": "sonnet",
-    "remediation":     "sonnet",
-}
-
-
-def _inject_bedrock_credentials() -> None:
-    """Resolve credentials via boto3 (handles SSO refresh) and export for LiteLLM.
-
-    Call this before each pipeline run so STS session tokens stay fresh.
-    If the underlying SSO session has expired, boto3 raises — the caller should
-    surface that error and prompt the user to run `aws sso login` again.
-    """
-    import boto3  # noqa: PLC0415
-    session = boto3.Session(profile_name=_AWS_PROFILE, region_name=_AWS_REGION)
-    creds = session.get_credentials()
-    if creds is None:
-        hint = (
-            f"Run `aws sso login --profile {_AWS_PROFILE}`."
-            if _AWS_PROFILE
-            else "Configure AWS credentials or set AWS_PROFILE in .env."
-        )
-        raise RuntimeError(f"No AWS credentials found. {hint}")
-    frozen = creds.get_frozen_credentials()
-    os.environ["AWS_ACCESS_KEY_ID"]     = frozen.access_key
-    os.environ["AWS_SECRET_ACCESS_KEY"] = frozen.secret_key
-    os.environ["AWS_DEFAULT_REGION"]    = _AWS_REGION
-    if frozen.token:
-        os.environ["AWS_SESSION_TOKEN"] = frozen.token
-    elif "AWS_SESSION_TOKEN" in os.environ:
-        del os.environ["AWS_SESSION_TOKEN"]  # clear a stale token from a previous session
 
 
 # ==========================================
@@ -358,7 +302,7 @@ if "auto_iterate" not in st.session_state:
 if "max_rounds" not in st.session_state:
     st.session_state.max_rounds = 3
 if "model_assignments" not in st.session_state:
-    st.session_state.model_assignments = dict(_DEFAULT_MODEL_ASSIGNMENTS)
+    st.session_state.model_assignments = dict(DEFAULT_MODEL_ASSIGNMENTS)
 
 
 def _interrupt_pipeline_thread():
@@ -459,54 +403,8 @@ with st.sidebar:
         st.success("Context loaded.")
 
     st.divider()
-    # Model assignment controls.
-    # _tier_options lists every available tier in display order.
-    # To expose a new model tier here: add it to _BEDROCK_MODEL_IDS / _ANTHROPIC_MODEL_IDS
-    # and append its key to this list.
-    _tier_options = ["haiku", "sonnet", "opus"]
-    _role_labels = {
-        "planner":         "Planner",
-        "architect":       "Architect",
-        "specialist":      "Specialists",
-        "auditor":         "Auditor",
-        "wiring_reviewer": "Wiring Reviewer",
-        "remediation":     "Remediation Eng.",
-    }
-    with st.expander("🤖 Model Assignments", expanded=False):
-        ma = st.session_state.model_assignments
-        for role_key, role_label in _role_labels.items():
-            current = ma.get(role_key, _DEFAULT_MODEL_ASSIGNMENTS[role_key])
-            chosen = st.selectbox(
-                role_label,
-                options=_tier_options,
-                index=_tier_options.index(current) if current in _tier_options else 0,
-                key=f"ma_{role_key}",
-            )
-            ma[role_key] = chosen
-        if st.button("Reset to defaults", key="ma_reset", use_container_width=True):
-            st.session_state.model_assignments = dict(_DEFAULT_MODEL_ASSIGNMENTS)
-            st.rerun()
-
-    st.divider()
-    st.markdown("**LLM Provider**")
-    if _USE_BEDROCK:
-        _profile_label = f"Profile: `{_AWS_PROFILE}`" if _AWS_PROFILE else "Default profile"
-        st.info(f"🟠 Bedrock — {_profile_label}\nRegion: `{_AWS_REGION}`")
-        if st.button("🔑 Refresh AWS Credentials", use_container_width=True,
-                     help="Re-run if your SSO session has expired."):
-            try:
-                _inject_bedrock_credentials()
-                st.success("Credentials refreshed.")
-            except Exception as _e:
-                profile_hint = (
-                    f"Run `aws sso login --profile {_AWS_PROFILE}` in your terminal."
-                    if _AWS_PROFILE else "Run `aws sso login` in your terminal."
-                )
-                st.error(f"{_e}\n\n{profile_hint}")
-    else:
-        st.info("🟣 Anthropic direct API")
-
-    st.divider()
+    _provider_label = "🟠 Bedrock" if USE_BEDROCK else "🟣 Anthropic"
+    st.caption(f"{_provider_label} · [⚙️ Settings](?page=Settings)")
     if st.button("🔄 Start Over"):
         reset()
         st.rerun()
@@ -523,13 +421,11 @@ with st.sidebar:
 # To change which tier a role uses, swap the llm argument when that agent
 # is instantiated in Phase 3 below. No other files need to change.
 # ==========================================
-_model_ids = _BEDROCK_MODEL_IDS if _USE_BEDROCK else _ANTHROPIC_MODEL_IDS
-_api_key   = None if _USE_BEDROCK else os.environ.get("ANTHROPIC_API_KEY")
+_model_ids  = BEDROCK_MODEL_IDS if USE_BEDROCK else ANTHROPIC_MODEL_IDS
+_api_key    = None if USE_BEDROCK else os.environ.get("ANTHROPIC_API_KEY")
 
-# For Bedrock, LiteLLM reads AWS_* env vars injected by _inject_bedrock_credentials().
-# No api_key argument is needed; passing one causes LiteLLM to treat it as Anthropic direct.
 _llm_kwargs = {"temperature": 0.2, "max_tokens": 8192}
-if not _USE_BEDROCK:
+if not USE_BEDROCK:
     _llm_kwargs["api_key"] = _api_key
 
 haiku_llm  = LLM(model=_model_ids["haiku"],  **_llm_kwargs)
@@ -537,18 +433,15 @@ sonnet_llm = LLM(model=_model_ids["sonnet"], **_llm_kwargs)
 opus_llm   = LLM(model=_model_ids["opus"],   **_llm_kwargs)
 
 _TIER_LLMS = {"haiku": haiku_llm, "sonnet": sonnet_llm, "opus": opus_llm}
-_TIER_COLORS = {"haiku": "#10B981", "sonnet": "#6366F1", "opus": "#F59E0B"}
-_TIER_ICONS  = {"haiku": "🟢", "sonnet": "🟣", "opus": "🟠"}
 
 
 def _llm_for(role_key: str) -> LLM:
-    """Return the LLM instance assigned to a pipeline role via the sidebar."""
-    tier = st.session_state.model_assignments.get(role_key, _DEFAULT_MODEL_ASSIGNMENTS[role_key])
+    tier = st.session_state.model_assignments.get(role_key, DEFAULT_MODEL_ASSIGNMENTS[role_key])
     return _TIER_LLMS.get(tier, haiku_llm)
 
 
 def _tier_for(role_key: str) -> str:
-    return st.session_state.model_assignments.get(role_key, _DEFAULT_MODEL_ASSIGNMENTS[role_key])
+    return st.session_state.model_assignments.get(role_key, DEFAULT_MODEL_ASSIGNMENTS[role_key])
 
 
 # ==========================================
@@ -569,13 +462,13 @@ if st.session_state.phase == "input":
 
     def _check_credentials() -> str | None:
         """Return an error string if credentials are missing, else None."""
-        if _USE_BEDROCK:
+        if USE_BEDROCK:
             try:
-                _inject_bedrock_credentials()
+                inject_bedrock_credentials()
             except Exception as exc:
                 profile_hint = (
-                    f"Run `aws sso login --profile {_AWS_PROFILE}` and reload the page."
-                    if _AWS_PROFILE else
+                    f"Run `aws sso login --profile {AWS_PROFILE}` and reload the page."
+                    if AWS_PROFILE else
                     "Run `aws sso login` and reload the page, or set AWS_PROFILE in .env."
                 )
                 return f"Bedrock credential error: {exc}\n{profile_hint}"
@@ -766,9 +659,9 @@ elif st.session_state.phase == "execute":
     # runs exactly once per pipeline execution even as Streamlit reruns the
     # script every polling tick.
     if not st.session_state.pipeline_running:
-        if _USE_BEDROCK:
+        if USE_BEDROCK:
             try:
-                _inject_bedrock_credentials()
+                inject_bedrock_credentials()
             except Exception as _cred_exc:
                 st.error(str(_cred_exc))
                 st.stop()
@@ -1175,8 +1068,8 @@ elif st.session_state.phase == "execute":
     def render_cards(active_idx, completed_set):
         for i, (ph, label, role_key) in enumerate(card_placeholders):
             tier       = _tier_for(role_key) if role_key != "python" else None
-            color      = _TIER_COLORS.get(tier, "#555") if tier else "#555"
-            tier_icon  = _TIER_ICONS.get(tier, "⚙️")   if tier else "⚙️"
+            color      = TIER_COLORS.get(tier, "#555") if tier else "#555"
+            tier_icon  = TIER_ICONS.get(tier, "⚙️")   if tier else "⚙️"
             tier_label = tier.title()                     if tier else "Python"
             model_str  = _model_ids.get(tier, "—")       if tier else "—"
             if i in completed_set:

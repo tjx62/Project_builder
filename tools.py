@@ -429,6 +429,98 @@ def render_validation_findings(errors: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_MEMORY_FILE = "project_memory.md"
+
+
+def update_project_memory(base_dir: str, audit_notes: str = "") -> None:
+    """Rewrite project_memory.md with current resource addresses and resolved findings.
+
+    Called before each git commit so the file is included in the same commit and
+    persists for the next run. Agents receive it via read_workspace_context() as a
+    preamble — before the full file contents — so they see past decisions and
+    resolved compliance issues without re-parsing every file.
+    """
+    from datetime import datetime
+    from pathlib import Path
+
+    memory_path = Path(base_dir) / _MEMORY_FILE
+
+    # Preserve the running list of resolved findings across runs.
+    existing_findings: list[str] = []
+    if memory_path.exists():
+        try:
+            existing = memory_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            existing = ""
+        m = re.search(
+            r"## Resolved Compliance Findings\n.*?\n((?:- .+\n?)*)",
+            existing, re.DOTALL
+        )
+        if m:
+            for line in m.group(1).splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- ") and stripped not in existing_findings:
+                    existing_findings.append(stripped)
+
+    # Current resource addresses from disk (mechanical — no LLM).
+    resources: list[str] = []
+    seen_r: set[str] = set()
+    for text in _read_disk_tf(base_dir):
+        for rtype, rname in _RESOURCE_DECL.findall(text):
+            addr = f"{rtype}.{rname}"
+            if addr not in seen_r:
+                seen_r.add(addr)
+                resources.append(addr)
+
+    # Accumulate new findings bullets from this run's audit notes.
+    if audit_notes:
+        for line in audit_notes.splitlines():
+            s = line.strip()
+            if s.startswith(("- ", "* ")) and len(s) > 12 and s not in existing_findings:
+                existing_findings.append(s if s.startswith("- ") else "- " + s[2:])
+
+    lines: list[str] = [
+        "# Project Memory",
+        "_Auto-updated after each pipeline run — do not edit by hand._",
+        "_Agents: read this before writing any new resources or compliance controls._\n",
+    ]
+
+    if resources:
+        lines.append("## Resources Already Built")
+        lines.append("Reference these exact addresses in new Terraform — do not recreate them.")
+        lines.extend(f"- `{r}`" for r in resources)
+        lines.append("")
+
+    if existing_findings:
+        lines.append("## Resolved Compliance Findings")
+        lines.append("These issues were found and fixed in prior runs — do not re-introduce them.")
+        lines.extend(existing_findings)
+        lines.append("")
+
+    lines.append(f"_Last updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}_")
+    memory_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_project_memory(base_dir: str) -> str | None:
+    """Return the project memory as a context preamble, or None if it doesn't exist yet."""
+    from pathlib import Path
+
+    path = Path(base_dir) / _MEMORY_FILE
+    if not path.exists():
+        return None
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return None
+    if not content:
+        return None
+    return (
+        "## Project Memory (accumulated from prior runs)\n\n"
+        + content
+        + "\n\n---\n"
+    )
+
+
 _INCLUDE_EXTENSIONS = {
     '.tf', '.hcl',                          # Terraform
     '.py', '.js', '.ts', '.go',             # application code
@@ -437,6 +529,7 @@ _INCLUDE_EXTENSIONS = {
 }
 _SKIP_DIRS = {'.git', '.terraform', '__pycache__', 'node_modules', '.venv', 'venv'}
 _SKIP_PATTERNS = ('*.tfstate', '*.tfstate.backup', '*.tfvars', '*.tfvars.json')
+_SKIP_FILES = {_MEMORY_FILE}   # handled separately via read_project_memory()
 _CONTEXT_CAP = 200_000  # chars — prevents flooding the context window
 
 
@@ -466,6 +559,8 @@ def read_workspace_context(base_dir: str) -> str | None:
         if path.suffix.lower() not in _INCLUDE_EXTENSIONS:
             continue
         rel = path.relative_to(root).as_posix()
+        if path.name in _SKIP_FILES:
+            continue
         if any(fnmatch.fnmatch(rel, pat.lstrip('*')) or
                fnmatch.fnmatch(path.name, pat.lstrip('*'))
                for pat in _SKIP_PATTERNS):
@@ -490,8 +585,11 @@ def read_workspace_context(base_dir: str) -> str | None:
         sections.append(block)
         total_chars += len(block)
 
+    memory = read_project_memory(str(root))
+
     if not sections:
-        return None
+        # No workspace files yet, but return memory alone if it exists.
+        return memory
 
     header = (
         f"## Existing workspace ({len(sections)} file(s))\n\n"
@@ -501,7 +599,8 @@ def read_workspace_context(base_dir: str) -> str | None:
         "Pay special attention to any `audit_findings.md` or similar findings "
         "files — treat every listed finding as a hard requirement to address.\n"
     )
-    return header + "\n\n".join(sections)
+    workspace = header + "\n\n".join(sections)
+    return (memory + workspace) if memory else workspace
 
 
 def write_findings(crew_result, base_dir: str, framework: str) -> dict:
@@ -522,8 +621,10 @@ def write_findings(crew_result, base_dir: str, framework: str) -> dict:
     except OSError as e:
         return {"file": "audit_findings.md", "error": f"write failed: {e}"}
 
+    update_project_memory(base_dir, audit_notes=report)
+
     try:
-        subprocess.run(["git", "add", "audit_findings.md"],
+        subprocess.run(["git", "add", "audit_findings.md", _MEMORY_FILE],
                        check=True, capture_output=True, cwd=base_dir)
         subprocess.run(["git", "commit", "-m", f"Add {framework} audit findings"],
                        check=True, capture_output=True, cwd=base_dir)
@@ -679,6 +780,12 @@ def commit_audited_output(crew_result, *, has_auditor: bool = True,
                 f.write(content)
             if derived not in written:
                 written.append(derived)
+
+    # Update project memory before committing so the memory file is included in
+    # the same commit. Accumulates resolved findings + current resource addresses.
+    update_project_memory(base_dir, audit_notes=audit_notes)
+    if _MEMORY_FILE not in written:
+        written.append(_MEMORY_FILE)
 
     summary = (f"Add {', '.join(written)}" if len(written) <= 3
                else f"Generated {len(written)} files")
