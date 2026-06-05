@@ -17,11 +17,13 @@ from crewai.events.types.agent_events import (
 from crewai.events.types.llm_events import LLMCallCompletedEvent
 
 from config import (
-    USE_BEDROCK, AWS_PROFILE, AWS_REGION,
     BEDROCK_MODEL_IDS, ANTHROPIC_MODEL_IDS,
     TIER_OPTIONS, TIER_COLORS, TIER_ICONS,
     DEFAULT_MODEL_ASSIGNMENTS, ROLE_LABELS,
-    inject_bedrock_credentials,
+    PROVIDER_LABELS, ORG_CONTEXT_PATH,
+    detect_provider_type, load_credentials_from_env,
+    inject_credentials_from_config, write_env_provider,
+    read_dark_mode, write_dark_mode,
 )
 from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS
 from planner import plan_specialists
@@ -42,6 +44,77 @@ ARCHITECT_MIN_SPECIALISTS = 3
 # 1. STREAMLIT CONFIGURATION
 # ==========================================
 st.set_page_config(page_title="Adaptive Code Builder", page_icon="🏗️", layout="wide")
+if "dark_mode" not in st.session_state:
+    st.session_state.dark_mode = read_dark_mode()
+
+_DARK_CSS = (
+    '[data-testid="stSidebarNav"]{display:none}'
+    ':root{--background-color:#0e1117;--secondary-background-color:#262730;--text-color:#fafafa}'
+    'html,body,.stApp,[data-testid="stAppViewContainer"]>div:first-child{background-color:#0e1117!important}'
+    '[data-testid="stSidebar"]>div:first-child{background-color:#1a1a2e!important}'
+    '[data-testid="stHeader"]{background-color:rgba(14,17,23,0.95)!important}'
+    'h1,h2,h3,h4,h5,h6,p,li,label,caption{color:#fafafa!important}'
+    '.stMarkdown,.stCaption,.stMetricLabel,.stMetricValue{color:#fafafa!important}'
+    '.stTextInput input,textarea{background-color:#262730!important;color:#fafafa!important}'
+    '[data-baseweb="select"] [data-baseweb="select-container"]{background-color:#262730!important}'
+    '[data-baseweb="select"] [data-baseweb="select-control"]{background-color:#262730!important}'
+    '[data-baseweb="select"] span{color:#fafafa!important}'
+    '.stAlert{background-color:#262730!important}'
+    '.stButton>button{background-color:#262730!important;color:#fafafa!important;border-color:rgba(250,250,250,0.2)!important}'
+    '.stButton>button:hover{background-color:#3a3a4a!important}'
+    '[data-testid="baseButton-primary"]{background-color:#ff4b4b!important;color:#fff!important;border-color:#ff4b4b!important}'
+    '[data-testid="stToggle"] [role="switch"]{background-color:#555!important;border-color:#555!important}'
+    '[data-testid="stSlider"] [data-baseweb="slider-track"]{background-color:#555!important}'
+    '[data-testid="stSlider"] [data-baseweb="slider-inner-track"]{background-color:#ff4b4b!important}'
+    '[data-testid="stSlider"] [data-baseweb="slider-handle"]{background-color:#fff!important;border-color:#ff4b4b!important}'
+    'hr{border-color:rgba(250,250,250,0.15)!important}'
+    '[data-testid="stTooltipHoverTarget"] svg{fill:#1a1a1a!important}'
+    '[data-testid="stTooltipHoverTarget"] svg path{fill:#1a1a1a!important}'
+    'html [role="tooltip"][class]{background-color:#3a3a4a!important;border-color:#555!important}'
+    'html [role="tooltip"][class] *{color:#fafafa!important;background-color:transparent!important}'
+    'html [data-baseweb="popover"][class],html [data-baseweb="menu"][class]{background-color:#262730!important;border-color:#444!important}'
+    'html ul[role="listbox"][class]{background-color:#262730!important}'
+    'html li[role="option"][class]{background-color:#262730!important;color:#fafafa!important}'
+    'html li[role="option"][class]:hover{background-color:#3a3a4a!important}'
+    'html li[class][aria-selected="true"]{background-color:#3a3a4a!important}'
+)
+_LIGHT_CSS = (
+    '[data-testid="stSidebarNav"]{display:none}'
+    ':root{--background-color:#f8f9fb;--secondary-background-color:#eef0f5;--text-color:#31333f}'
+    'html,body,.stApp,[data-testid="stAppViewContainer"]>div:first-child{background-color:#f8f9fb!important}'
+    '[data-testid="stSidebar"]>div:first-child{background-color:#eef0f5!important}'
+    '[data-testid="stHeader"]{background-color:rgba(248,249,251,0.95)!important}'
+    'h1,h2,h3,h4,h5,h6,p,li,label,caption{color:#31333f!important}'
+    '.stMarkdown,.stCaption,.stMetricLabel,.stMetricValue{color:#31333f!important}'
+    '.stTextInput input,textarea{background-color:#ffffff!important;color:#31333f!important}'
+    '[data-baseweb="select"] [data-baseweb="select-container"]{background-color:#ffffff!important}'
+    '[data-baseweb="select"] [data-baseweb="select-control"]{background-color:#ffffff!important}'
+    '[data-baseweb="select"] span{color:#31333f!important}'
+    '.stAlert{background-color:#ffffff!important}'
+    '.stButton>button{background-color:#ffffff!important;color:#31333f!important;border-color:rgba(49,51,63,0.2)!important}'
+    '.stButton>button:hover{background-color:#f0f2f6!important}'
+    '[data-testid="baseButton-primary"]{background-color:#ff4b4b!important;color:#fff!important;border-color:#ff4b4b!important}'
+    '[data-testid="stToggle"] [role="switch"]{background-color:#ccc!important;border-color:#ccc!important}'
+    '[data-testid="stSlider"] [data-baseweb="slider-track"]{background-color:#ccc!important}'
+    '[data-testid="stSlider"] [data-baseweb="slider-inner-track"]{background-color:#ff4b4b!important}'
+    '[data-testid="stSlider"] [data-baseweb="slider-handle"]{background-color:#fff!important;border-color:#ff4b4b!important}'
+    'hr{border-color:rgba(49,51,63,0.15)!important}'
+    '[data-testid="stTooltipHoverTarget"] svg{fill:#ffffff!important}'
+    '[data-testid="stTooltipHoverTarget"] svg path{fill:#ffffff!important}'
+    'html [role="tooltip"][class]{background-color:#ffffff!important;border-color:#ddd!important;box-shadow:0 2px 8px rgba(0,0,0,0.15)!important}'
+    'html [role="tooltip"][class] *{color:#31333f!important;background-color:transparent!important}'
+    'html [data-baseweb="popover"][class],html [data-baseweb="menu"][class]{background-color:#ffffff!important;border-color:#ddd!important}'
+    'html ul[role="listbox"][class]{background-color:#ffffff!important}'
+    'html li[role="option"][class]{background-color:#ffffff!important;color:#31333f!important}'
+    'html li[role="option"][class]:hover{background-color:#f0f2f6!important}'
+    'html li[class][aria-selected="true"]{background-color:#e8eaf0!important}'
+)
+
+# Inject via JS so our style tag lands at the END of document.head, after
+# emotion/BaseWeb styles, guaranteeing cascade priority for portal elements
+# (tooltips, dropdowns) that render outside the Streamlit container.
+_theme_css = _DARK_CSS if st.session_state.get("dark_mode", True) else _LIGHT_CSS
+st.markdown(f"<style>{_theme_css}</style>", unsafe_allow_html=True)
 st.title("🏗️ Adaptive AI Code Builder")
 st.markdown("Specialists chosen on the fly based on your project request.")
 
@@ -280,7 +353,11 @@ if "plan" not in st.session_state:
 if "project_request" not in st.session_state:
     st.session_state.project_request = ""
 if "context_text" not in st.session_state:
-    st.session_state.context_text = "No additional organizational context provided."
+    st.session_state.context_text = (
+        ORG_CONTEXT_PATH.read_text(encoding="utf-8")
+        if ORG_CONTEXT_PATH.exists()
+        else "No additional organizational context provided."
+    )
 if "confirmed_ids" not in st.session_state:
     st.session_state.confirmed_ids = []
 if "pipeline_done" not in st.session_state:
@@ -303,6 +380,10 @@ if "max_rounds" not in st.session_state:
     st.session_state.max_rounds = 3
 if "model_assignments" not in st.session_state:
     st.session_state.model_assignments = dict(DEFAULT_MODEL_ASSIGNMENTS)
+if "provider_type" not in st.session_state:
+    st.session_state.provider_type = detect_provider_type()
+if "provider_credentials" not in st.session_state:
+    st.session_state.provider_credentials = load_credentials_from_env()
 
 
 def _interrupt_pipeline_thread():
@@ -336,6 +417,165 @@ def reset():
         st.session_state.pop(key, None)
 
 
+@st.dialog("⚙️ Settings", width="large")
+def _settings_dialog():
+    tab_provider, tab_context, tab_models, tab_appearance = st.tabs(
+        ["LLM Provider", "Organizational Context", "Model Assignments", "Appearance"]
+    )
+
+    # ── Provider ──────────────────────────────────────────────────────────
+    with tab_provider:
+        PROVIDER_OPTIONS = {
+            "anthropic":    "🟣 Anthropic (API Key)",
+            "bedrock_sso":  "🟠 AWS Bedrock — SSO / STS",
+            "bedrock_keys": "🟠 AWS Bedrock — Access Keys",
+        }
+        options_list  = list(PROVIDER_OPTIONS.keys())
+        current_type  = st.session_state.provider_type
+        selected_type = st.radio(
+            "Provider",
+            options=options_list,
+            format_func=lambda k: PROVIDER_OPTIONS[k],
+            index=options_list.index(current_type) if current_type in options_list else 0,
+            label_visibility="collapsed",
+        )
+
+        st.markdown("")
+        creds = dict(st.session_state.provider_credentials)
+
+        if selected_type == "anthropic":
+            creds["api_key"] = st.text_input(
+                "Anthropic API Key", value=creds.get("api_key", ""),
+                type="password", placeholder="sk-ant-...",
+                help="Your API key from console.anthropic.com.",
+            )
+            st.caption("API access requires separate credits from console.anthropic.com.")
+
+        elif selected_type == "bedrock_sso":
+            c1, c2 = st.columns(2)
+            creds["aws_profile"] = c1.text_input(
+                "AWS Profile", value=creds.get("aws_profile", ""), placeholder="my-sso-profile",
+            )
+            creds["aws_region"] = c2.text_input(
+                "AWS Region", value=creds.get("aws_region", "us-east-1"), placeholder="us-east-1",
+            )
+            profile = creds.get("aws_profile", "")
+            login_cmd = f"`aws sso login --profile {profile}`" if profile else "`aws sso login`"
+            st.caption(f"Run {login_cmd} in your terminal before using the app.")
+            if st.button("🔑 Refresh Credentials"):
+                try:
+                    inject_credentials_from_config("bedrock_sso", creds)
+                    st.success("Credentials refreshed.")
+                except Exception as e:
+                    hint = f"Run `aws sso login --profile {profile}`." if profile else "Run `aws sso login`."
+                    st.error(f"{e}\n\n{hint}")
+
+        elif selected_type == "bedrock_keys":
+            c1, c2 = st.columns(2)
+            creds["aws_access_key_id"] = c1.text_input(
+                "Access Key ID", value=creds.get("aws_access_key_id", ""),
+                placeholder="AKIAIOSFODNN7EXAMPLE",
+            )
+            creds["aws_region"] = c2.text_input(
+                "AWS Region", value=creds.get("aws_region", "us-east-1"), placeholder="us-east-1",
+            )
+            creds["aws_secret_access_key"] = st.text_input(
+                "Secret Access Key", value=creds.get("aws_secret_access_key", ""),
+                type="password", placeholder="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            )
+            creds["aws_session_token"] = st.text_input(
+                "Session Token (optional)", value=creds.get("aws_session_token", ""),
+                type="password", placeholder="Leave blank for long-lived IAM keys.",
+            )
+
+        st.markdown("")
+        if st.button("💾 Save & Apply", type="primary", key="provider_save"):
+            _valid = True
+            if selected_type == "anthropic" and not creds.get("api_key", "").strip():
+                st.error("API key is required.")
+                _valid = False
+            elif selected_type == "bedrock_sso" and not creds.get("aws_region", "").strip():
+                st.error("AWS Region is required.")
+                _valid = False
+            elif selected_type == "bedrock_keys":
+                if not creds.get("aws_access_key_id", "").strip():
+                    st.error("Access Key ID is required.")
+                    _valid = False
+                elif not creds.get("aws_secret_access_key", "").strip():
+                    st.error("Secret Access Key is required.")
+                    _valid = False
+                elif not creds.get("aws_region", "").strip():
+                    st.error("AWS Region is required.")
+                    _valid = False
+            if _valid:
+                try:
+                    write_env_provider(selected_type, creds)
+                    st.session_state.provider_type        = selected_type
+                    st.session_state.provider_credentials = dict(creds)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to write .env: {e}")
+
+    # ── Organizational Context ─────────────────────────────────────────────
+    with tab_context:
+        st.caption("Saved to `org_context.md` and loaded automatically on every run.")
+        if ORG_CONTEXT_PATH.exists():
+            _ctx_size = ORG_CONTEXT_PATH.stat().st_size
+            st.success(f"Active — `org_context.md` ({_ctx_size:,} bytes)")
+            with st.expander("Preview"):
+                _preview = ORG_CONTEXT_PATH.read_text(encoding="utf-8")
+                st.markdown(_preview[:2000] + ("\n\n*… (truncated)*" if _ctx_size > 2000 else ""))
+            if st.button("🗑️ Remove", type="secondary"):
+                ORG_CONTEXT_PATH.unlink()
+                st.session_state.context_text = "No additional organizational context provided."
+                st.rerun()
+        else:
+            st.info("No context file — upload one below.")
+
+        uploaded = st.file_uploader("Upload guidelines file", type=["md", "txt"], label_visibility="collapsed")
+        if uploaded is not None:
+            content = uploaded.getvalue().decode("utf-8")
+            ORG_CONTEXT_PATH.write_text(content, encoding="utf-8")
+            st.session_state.context_text = content
+            st.rerun()
+
+    # ── Model Assignments ──────────────────────────────────────────────────
+    with tab_models:
+        st.caption("Changes take effect on the next pipeline run — no restart needed.")
+        _is_bedrock_sel = st.session_state.provider_type in ("bedrock_sso", "bedrock_keys")
+        model_ids = BEDROCK_MODEL_IDS if _is_bedrock_sel else ANTHROPIC_MODEL_IDS
+        ma   = st.session_state.model_assignments
+        cols = st.columns(3)
+        for i, (role_key, role_label) in enumerate(ROLE_LABELS.items()):
+            with cols[i % 3]:
+                current = ma.get(role_key, DEFAULT_MODEL_ASSIGNMENTS[role_key])
+                chosen  = st.selectbox(
+                    role_label, options=TIER_OPTIONS,
+                    index=TIER_OPTIONS.index(current) if current in TIER_OPTIONS else 0,
+                    key=f"dlg_ma_{role_key}",
+                )
+                ma[role_key] = chosen
+                st.caption(f"`{model_ids.get(chosen, chosen)}`")
+
+        st.markdown("")
+        if st.button("Reset to defaults", key="dlg_reset_models"):
+            st.session_state.model_assignments = dict(DEFAULT_MODEL_ASSIGNMENTS)
+            st.rerun()
+
+    # ── Appearance ─────────────────────────────────────────────────────────
+    with tab_appearance:
+        st.caption("Saved to `.streamlit/config.toml`. Page reloads to apply the new theme to all components.")
+        _dark = st.toggle("Dark mode", value=st.session_state.dark_mode, key="dlg_dark_mode")
+        if _dark != st.session_state.dark_mode:
+            write_dark_mode(_dark)
+            st.session_state.dark_mode = _dark
+            st.html(
+                "<script>setTimeout(()=>window.location.reload(),150);</script>",
+                unsafe_allow_javascript=True,
+            )
+            st.stop()
+
+
 # ==========================================
 # 3. SIDEBAR — global config (always visible)
 # ==========================================
@@ -356,21 +596,18 @@ with st.sidebar:
             st.session_state.project_path = chosen
             st.rerun()
 
-    mode_col1, mode_col2 = st.columns(2)
-    with mode_col1:
-        st.session_state.audit_only = st.toggle(
-            "Audit Only",
-            value=st.session_state.audit_only,
-            disabled=st.session_state.auto_iterate,
-            help="Skip code generation — audit existing files only.",
-        )
-    with mode_col2:
-        st.session_state.auto_iterate = st.toggle(
-            "Auto-iterate",
-            value=st.session_state.auto_iterate,
-            disabled=st.session_state.audit_only,
-            help="Generate → audit → fix, repeated until compliant or max rounds reached.",
-        )
+    st.session_state.audit_only = st.toggle(
+        "Audit Only",
+        value=st.session_state.audit_only,
+        disabled=st.session_state.auto_iterate,
+        help="Skip code generation — audit existing files only.",
+    )
+    st.session_state.auto_iterate = st.toggle(
+        "Auto-iterate",
+        value=st.session_state.auto_iterate,
+        disabled=st.session_state.audit_only,
+        help="Generate → audit → fix, repeated until compliant or max rounds reached.",
+    )
 
     # Both modes require a real framework — auto-bump from None if needed.
     if (st.session_state.audit_only or st.session_state.auto_iterate) \
@@ -396,18 +633,15 @@ with st.sidebar:
 
     project_path = st.session_state.project_path
 
-    st.header("📄 Organizational Context")
-    uploaded_file = st.file_uploader("Upload Guidelines File", type=["md", "txt"])
-    if uploaded_file is not None:
-        st.session_state.context_text = uploaded_file.getvalue().decode("utf-8")
-        st.success("Context loaded.")
-
-    st.divider()
-    _provider_label = "🟠 Bedrock" if USE_BEDROCK else "🟣 Anthropic"
-    st.caption(f"{_provider_label} · [⚙️ Settings](?page=Settings)")
     if st.button("🔄 Start Over"):
         reset()
         st.rerun()
+
+    st.divider()
+    _provider_label = PROVIDER_LABELS.get(st.session_state.provider_type, "🟣 Anthropic")
+    st.caption(_provider_label)
+    if st.button("⚙️ Settings", use_container_width=True):
+        _settings_dialog()
 
 
 # ==========================================
@@ -417,15 +651,18 @@ with st.sidebar:
 #   Sonnet  → specialists + wiring reviewer (implementation, instruction-following)
 #   Opus    → architect + auditors (high-stakes reasoning and compliance review)
 #
-# Model strings and kwargs adapt automatically based on LLM_PROVIDER in .env.
-# To change which tier a role uses, swap the llm argument when that agent
-# is instantiated in Phase 3 below. No other files need to change.
+# Provider and credentials are read from session state so changes in Settings
+# take effect immediately without an app restart.
 # ==========================================
-_model_ids  = BEDROCK_MODEL_IDS if USE_BEDROCK else ANTHROPIC_MODEL_IDS
-_api_key    = None if USE_BEDROCK else os.environ.get("ANTHROPIC_API_KEY")
+_is_bedrock = st.session_state.provider_type in ("bedrock_sso", "bedrock_keys")
+_model_ids  = BEDROCK_MODEL_IDS if _is_bedrock else ANTHROPIC_MODEL_IDS
+_api_key    = (
+    None if _is_bedrock
+    else (st.session_state.provider_credentials.get("api_key") or os.environ.get("ANTHROPIC_API_KEY"))
+)
 
 _llm_kwargs = {"temperature": 0.2, "max_tokens": 8192}
-if not USE_BEDROCK:
+if not _is_bedrock:
     _llm_kwargs["api_key"] = _api_key
 
 haiku_llm  = LLM(model=_model_ids["haiku"],  **_llm_kwargs)
@@ -462,19 +699,24 @@ if st.session_state.phase == "input":
 
     def _check_credentials() -> str | None:
         """Return an error string if credentials are missing, else None."""
-        if USE_BEDROCK:
-            try:
-                inject_bedrock_credentials()
-            except Exception as exc:
-                profile_hint = (
-                    f"Run `aws sso login --profile {AWS_PROFILE}` and reload the page."
-                    if AWS_PROFILE else
-                    "Run `aws sso login` and reload the page, or set AWS_PROFILE in .env."
-                )
-                return f"Bedrock credential error: {exc}\n{profile_hint}"
+        ptype = st.session_state.provider_type
+        pcreds = st.session_state.provider_credentials
+        if ptype == "anthropic":
+            if not pcreds.get("api_key"):
+                return "Anthropic API key is missing. Set it in Settings."
         else:
-            if not _api_key:
-                return "ANTHROPIC_API_KEY is missing from your .env file."
+            try:
+                inject_credentials_from_config(ptype, pcreds)
+            except Exception as exc:
+                if ptype == "bedrock_sso":
+                    profile = pcreds.get("aws_profile") or ""
+                    hint = (
+                        f"Run `aws sso login --profile {profile}` and reload the page."
+                        if profile else
+                        "Run `aws sso login` and reload the page."
+                    )
+                    return f"Bedrock credential error: {exc}\n{hint}"
+                return f"Bedrock credential error: {exc}"
         return None
 
     if _audit_mode:
@@ -659,9 +901,12 @@ elif st.session_state.phase == "execute":
     # runs exactly once per pipeline execution even as Streamlit reruns the
     # script every polling tick.
     if not st.session_state.pipeline_running:
-        if USE_BEDROCK:
+        if _is_bedrock:
             try:
-                inject_bedrock_credentials()
+                inject_credentials_from_config(
+                    st.session_state.provider_type,
+                    st.session_state.provider_credentials,
+                )
             except Exception as _cred_exc:
                 st.error(str(_cred_exc))
                 st.stop()
@@ -1073,11 +1318,11 @@ elif st.session_state.phase == "execute":
             tier_label = tier.title()                     if tier else "Python"
             model_str  = _model_ids.get(tier, "—")       if tier else "—"
             if i in completed_set:
-                bg, border, icon, opacity = "#0d1f0d", "#22c55e", "✅", "0.9"
+                bg, border, icon, opacity = ("#0d1f0d", "#22c55e", "✅", "0.9") if st.session_state.dark_mode else ("#dcfce7", "#16a34a", "✅", "0.9")
             elif i == active_idx:
-                bg, border, icon, opacity = "#0d0d1f", color, "⚡", "1.0"
+                bg, border, icon, opacity = ("#0d0d1f", color, "⚡", "1.0") if st.session_state.dark_mode else ("#ede9fe", color, "⚡", "1.0")
             else:
-                bg, border, icon, opacity = "#111", "#2a2a2a", "·", "0.45"
+                bg, border, icon, opacity = ("#111", "#2a2a2a", "·", "0.45") if st.session_state.dark_mode else ("#f1f5f9", "#cbd5e1", "·", "0.55")
             ph.markdown(
                 f"""<div style="background:{bg};border:2px solid {border};border-radius:10px;
                     padding:12px 6px;text-align:center;opacity:{opacity};">
