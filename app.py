@@ -583,23 +583,6 @@ def _settings_dialog():
             )
             st.stop()
 
-        st.divider()
-        st.subheader("Prompt Caching")
-        st.caption(
-            "Cache writes cost **125%** of the input rate; reads cost **10%**. "
-            "Caching only pays off when a large stable prefix (>1,024 tokens for Sonnet/Opus, "
-            ">2,048 for Haiku) is reused across multiple rounds. "
-            "Best enabled for **auto-iterate runs with a large org-context doc**."
-        )
-        _caching = st.toggle(
-            "Enable prompt caching",
-            value=read_prompt_caching(),
-            key="dlg_prompt_caching",
-            help="Persisted to .env as ANTHROPIC_PROMPT_CACHING.",
-        )
-        if _caching != read_prompt_caching():
-            write_prompt_caching(_caching)
-            st.success("Saved." if _caching else "Caching disabled.")
 
 
 # ==========================================
@@ -656,6 +639,17 @@ with st.sidebar:
                if st.session_state.compliance_framework in fw_options else 0,
         help="Auditor reviews output against this framework. 'None' skips the audit step entirely.",
     )
+
+    _caching = st.toggle(
+        "Prompt Caching",
+        value=read_prompt_caching(),
+        help=(
+            "Cache writes cost 125% of the input rate; reads cost 10%. "
+            "Only beneficial for auto-iterate runs with a large org-context doc."
+        ),
+    )
+    if _caching != read_prompt_caching():
+        write_prompt_caching(_caching)
 
     project_path = st.session_state.project_path
 
@@ -867,7 +861,7 @@ elif st.session_state.phase == "execute":
         if cc_total > 0 and cr_total == 0:
             st.caption(
                 "💸 Caching had **0 hits** this run — cache writes added cost with no benefit. "
-                "Consider disabling prompt caching in **Settings → Appearance** for runs like this."
+                "Consider disabling **Prompt Caching** in the sidebar for runs like this."
             )
 
         with st.expander("📊 Per-model breakdown"):
@@ -951,14 +945,14 @@ elif st.session_state.phase == "execute":
                 "⚠️ **Prompt caching is on** but unlikely to save money on this run "
                 "(all-Haiku, single-pass, small context). "
                 "Cache writes cost 25% extra when hits are zero. "
-                "Disable in **Settings → Appearance**.",
+                "Disable via the **Prompt Caching** toggle in the sidebar.",
                 icon=None,
             )
         elif not _cache_on and _score >= 2:
             st.info(
                 "💡 **Prompt caching is off.** This run (auto-iterate + Sonnet/Opus or large "
                 "org context) is a good candidate — enabling it could reduce costs. "
-                "Toggle in **Settings → Appearance**.",
+                "Toggle **Prompt Caching** in the sidebar.",
                 icon=None,
             )
 
