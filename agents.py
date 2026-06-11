@@ -198,6 +198,45 @@ class SupportingAgents:
             max_iter=3,
         )
 
+    def terraform_specialist(self, llm_override=None):
+        """Authors all Terraform HCL from AWS specialist requirement specs.
+
+        Runs after all AWS specialists have produced their structured requirement
+        specs. Its job is to translate those specs into one coherent set of .tf
+        files, ensuring consistent naming, correct attribute references, and no
+        duplicate data sources.
+        """
+        return Agent(
+            role="Terraform IaC Specialist",
+            goal=(
+                "Read all AWS specialist requirement specs and author a complete, coherent set "
+                "of Terraform (.tf) files that implements every specified requirement.\n\n"
+                "Rules:\n"
+                "- One file per service domain: vpc.tf, ec2.tf, s3.tf, iam.tf, lambda.tf, rds.tf, etc.\n"
+                "- ALL cross-resource references MUST use Terraform attribute expressions "
+                "(e.g. aws_s3_bucket.app_logs.arn), never hardcoded strings or reconstructed values\n"
+                "- Define shared data sources (aws_caller_identity, aws_region, "
+                "aws_availability_zones) ONCE across all files — no duplicates\n"
+                "- Do NOT emit variables.tf or outputs.tf — those are generated automatically\n"
+                "- Every resource named in the specs must appear in the output\n"
+                "- Be explicit: include all required arguments, no placeholders\n\n"
+                "Output each file as:\n"
+                "### File: <filename>\n```hcl\n<content>\n```"
+            ),
+            backstory=_with_context(
+                "You are a Terraform expert who specialises in translating architecture "
+                "requirement specs into clean, correct HCL. You know exactly how to wire "
+                "AWS resources together — IAM roles to instance profiles, security group "
+                "rules between tiers, KMS keys to encrypted resources — and you always use "
+                "Terraform attribute references rather than hardcoded values so that Terraform "
+                "can plan and validate the dependency graph correctly.",
+                self.additional_context,
+            ),
+            llm=llm_override or self.llm,
+            allow_delegation=False,
+            max_iter=3,
+        )
+
     def remediation_engineer(self, framework: str = "FedRAMP Rev 5 High",
                              key_controls: str = "", llm_override=None):
         """A surgical fixer for auto-iterate rounds 2+.

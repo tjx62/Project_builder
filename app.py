@@ -24,8 +24,9 @@ from config import (
     detect_provider_type, load_credentials_from_env,
     inject_credentials_from_config, write_env_provider,
     read_dark_mode, write_dark_mode,
+    read_prompt_caching, write_prompt_caching,
 )
-from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS
+from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS, SPECIALIST_IS_AWS
 from planner import plan_specialists
 from agents import SupportingAgents
 from tasks import build_tasks, build_remediation_tasks, build_wiring_review_task
@@ -176,11 +177,18 @@ def _pick_directory(initial_dir: str = ".") -> str | None:
         init_clause = f"$d.SelectedPath = '{win_init}'; " if win_init else ""
         ps = (
             "Add-Type -AssemblyName System.Windows.Forms; "
+            # Invisible top-most owner window forces the dialog to the front on WSL2
+            # where there is no parent HWND to give it focus automatically.
+            "$owner = New-Object System.Windows.Forms.Form; "
+            "$owner.TopMost = $true; $owner.StartPosition = 'CenterScreen'; "
+            "$owner.Width = 0; $owner.Height = 0; $owner.ShowInTaskbar = $false; "
+            "$owner.Show(); $owner.Hide(); "
             "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
             "$d.Description = 'Select project directory'; "
             "$d.ShowNewFolderButton = $true; "
             + init_clause
-            + "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
+            + "if ($d.ShowDialog($owner) -eq 'OK') { Write-Output $d.SelectedPath }; "
+            "$owner.Dispose()"
         )
         try:
             result = subprocess.run(
@@ -575,6 +583,24 @@ def _settings_dialog():
             )
             st.stop()
 
+        st.divider()
+        st.subheader("Prompt Caching")
+        st.caption(
+            "Cache writes cost **125%** of the input rate; reads cost **10%**. "
+            "Caching only pays off when a large stable prefix (>1,024 tokens for Sonnet/Opus, "
+            ">2,048 for Haiku) is reused across multiple rounds. "
+            "Best enabled for **auto-iterate runs with a large org-context doc**."
+        )
+        _caching = st.toggle(
+            "Enable prompt caching",
+            value=read_prompt_caching(),
+            key="dlg_prompt_caching",
+            help="Persisted to .env as ANTHROPIC_PROMPT_CACHING.",
+        )
+        if _caching != read_prompt_caching():
+            write_prompt_caching(_caching)
+            st.success("Saved." if _caching else "Caching disabled.")
+
 
 # ==========================================
 # 3. SIDEBAR — global config (always visible)
@@ -838,6 +864,11 @@ elif st.session_state.phase == "execute":
             f"fresh input **{fresh:,}** · output **{out:,}** · "
             f"hit rate **{hit_rate:.0f}%**"
         )
+        if cc_total > 0 and cr_total == 0:
+            st.caption(
+                "💸 Caching had **0 hits** this run — cache writes added cost with no benefit. "
+                "Consider disabling prompt caching in **Settings → Appearance** for runs like this."
+            )
 
         with st.expander("📊 Per-model breakdown"):
             for tier, t in tokens.items():
@@ -896,6 +927,41 @@ elif st.session_state.phase == "execute":
             st.rerun()
         st.stop()
 
+    # --- Cache advisor: show a tip before the pipeline starts ---
+    # Evaluate whether prompt caching is likely to help or hurt for this run.
+    # Score-based: auto-iterate + large context + Sonnet/Opus → likely helpful;
+    # all-Haiku single-pass → likely costs more than it saves.
+    if not st.session_state.pipeline_running and not st.session_state.pipeline_done:
+        _cache_on = read_prompt_caching()
+        _ma = st.session_state.model_assignments
+        _all_haiku = all(_ma.get(r, "haiku") == "haiku" for r in ["specialist", "terraform_specialist", "auditor", "architect"])
+        _any_upper = any(_ma.get(r, "haiku") in ("sonnet", "opus") for r in ["specialist", "terraform_specialist", "auditor", "architect"])
+        _ctx_tokens = len(st.session_state.context_text or "") // 4
+        _score = 0
+        if st.session_state.auto_iterate and st.session_state.max_rounds >= 2:
+            _score += 1
+        if _ctx_tokens > 500:
+            _score += 1
+        if _any_upper:
+            _score += 1
+        if _all_haiku:
+            _score -= 1
+        if _cache_on and _score < 0:
+            st.warning(
+                "⚠️ **Prompt caching is on** but unlikely to save money on this run "
+                "(all-Haiku, single-pass, small context). "
+                "Cache writes cost 25% extra when hits are zero. "
+                "Disable in **Settings → Appearance**.",
+                icon=None,
+            )
+        elif not _cache_on and _score >= 2:
+            st.info(
+                "💡 **Prompt caching is off.** This run (auto-iterate + Sonnet/Opus or large "
+                "org context) is a good candidate — enabling it could reduce costs. "
+                "Toggle in **Settings → Appearance**.",
+                icon=None,
+            )
+
     # --- First entry: build and launch the crew in a background thread ---
     # pipeline_running stays False until the thread is started, so this block
     # runs exactly once per pipeline execution even as Streamlit reruns the
@@ -922,10 +988,11 @@ elif st.session_state.phase == "execute":
         reviewer_llm = _llm_for("wiring_reviewer")
         architect_llm = _llm_for("architect")
 
-        support_architect = SupportingAgents(architect_llm, additional_context=context_text)
-        support_auditor   = SupportingAgents(auditor_llm,   additional_context=context_text)
-        support_reviewer  = SupportingAgents(reviewer_llm,  additional_context=context_text)
-        support_remediation = SupportingAgents(_llm_for("remediation"), additional_context=context_text)
+        support_architect   = SupportingAgents(architect_llm,                        additional_context=context_text)
+        support_auditor     = SupportingAgents(auditor_llm,                          additional_context=context_text)
+        support_reviewer    = SupportingAgents(reviewer_llm,                         additional_context=context_text)
+        support_remediation = SupportingAgents(_llm_for("remediation"),              additional_context=context_text)
+        support_terraform   = SupportingAgents(_llm_for("terraform_specialist"),     additional_context=context_text)
 
         is_auto_iterate = st.session_state.auto_iterate
         max_rounds      = st.session_state.max_rounds
@@ -954,6 +1021,14 @@ elif st.session_state.phase == "execute":
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
             architect    = support_architect.architect() if use_architect else None
+            has_terraform = any(
+                SPECIALIST_IS_AWS.get(sid, False)
+                for sid in st.session_state.confirmed_ids
+            )
+            terraform_specialist_agent = (
+                support_terraform.terraform_specialist(llm_override=_llm_for("terraform_specialist"))
+                if has_terraform else None
+            )
             # Inline auditor applies compliance fixes during round-1 full pass.
             # Report auditor verifies compliance after each round.
             # Fixer applies targeted fixes in rounds 2+.
@@ -974,28 +1049,38 @@ elif st.session_state.phase == "execute":
             generate_crew_agents = (
                 ([architect] if architect else [])
                 + [agent for _, agent in specialist_agents]
+                + ([terraform_specialist_agent] if terraform_specialist_agent else [])
                 + [inline_auditor]
                 + [wiring_reviewer]
             )
             pipeline = (
-                ([("Architect", "architect", architect)] if architect else [])
-                + [(sid.upper(), "specialist", agent) for sid, agent in specialist_agents]
-                + [("Auditor", "auditor", inline_auditor)]
-                + [("Wiring Review", "wiring_reviewer", wiring_reviewer)]
-                + [("Git", "python", None)]
+                ([("Architect",      "architect",            architect)]                  if architect              else [])
+                + [(sid.upper(),     "specialist",           agent)                       for sid, agent in specialist_agents]
+                + ([("Terraform",    "terraform_specialist", terraform_specialist_agent)] if terraform_specialist_agent else [])
+                + [("Auditor",       "auditor",              inline_auditor)]
+                + [("Wiring Review", "wiring_reviewer",      wiring_reviewer)]
+                + [("Git",           "python",               None)]
             )
             findings_idx = None
             crew_agents  = generate_crew_agents   # for role_to_idx only
             tasks        = []  # built inside run_crew each round
 
         else:
-            # ── Normal: (Architect) → Specialists → (Auditor) → Wiring Review → Git ──
+            # ── Normal: (Architect) → Specialists → (Terraform) → (Auditor) → Wiring Review → Git ──
             specialist_agents = [
                 (sid, SPECIALISTS[sid](_llm_for("specialist"), additional_context=context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
             architect   = support_architect.architect() if use_architect else None
+            has_terraform = any(
+                SPECIALIST_IS_AWS.get(sid, False)
+                for sid in st.session_state.confirmed_ids
+            )
+            terraform_specialist_agent = (
+                support_terraform.terraform_specialist(llm_override=_llm_for("terraform_specialist"))
+                if has_terraform else None
+            )
             has_auditor = bool(framework_name and framework_name != "None")
             auditor     = (
                 support_auditor.compliance_auditor(
@@ -1005,16 +1090,18 @@ elif st.session_state.phase == "execute":
             )
             wiring_reviewer = support_reviewer.wiring_reviewer(llm_override=reviewer_llm)
             pipeline  = (
-                ([("Architect",      "architect",      architect)]       if architect   else [])
-                + [(sid.upper(),     "specialist",     agent)            for sid, agent in specialist_agents]
-                + ([("Auditor",      "auditor",        auditor)]         if has_auditor else [])
-                + [("Wiring Review", "wiring_reviewer", wiring_reviewer)]
-                + [("Git",           "python",          None)]
+                ([("Architect",      "architect",            architect)]                  if architect            else [])
+                + [(sid.upper(),     "specialist",           agent)                       for sid, agent in specialist_agents]
+                + ([("Terraform",    "terraform_specialist", terraform_specialist_agent)] if terraform_specialist_agent else [])
+                + ([("Auditor",      "auditor",              auditor)]                   if has_auditor          else [])
+                + [("Wiring Review", "wiring_reviewer",      wiring_reviewer)]
+                + [("Git",           "python",               None)]
             )
             findings_idx = None
             crew_agents  = (
                 ([architect] if architect else [])
                 + [agent for _, agent in specialist_agents]
+                + ([terraform_specialist_agent] if terraform_specialist_agent else [])
                 + ([auditor]   if has_auditor    else [])
                 + [wiring_reviewer]
             )
@@ -1025,6 +1112,7 @@ elif st.session_state.phase == "execute":
                 key_controls=key_controls,
                 existing_context=existing_context,
                 wiring_reviewer=wiring_reviewer,
+                terraform_specialist_agent=terraform_specialist_agent,
             )
 
         git_step_idx = len(pipeline) - 1
@@ -1159,6 +1247,7 @@ elif st.session_state.phase == "execute":
                                 key_controls=key_controls,
                                 existing_context=round_ctx,
                                 wiring_reviewer=wiring_reviewer,
+                                terraform_specialist_agent=terraform_specialist_agent,
                             )
                             gen_crew = _make_crew(generate_crew_agents, round_tasks)
                             allowed = None

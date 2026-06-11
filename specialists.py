@@ -32,9 +32,16 @@ def _backstory(base: str, additional_context: str | None) -> str:
 def vpc_specialist(llm, additional_context: str | None = None):
     return Agent(
         role='AWS VPC & Networking Specialist',
-        goal='Design VPCs, subnets, route tables, NAT gateways, and security groups.',
+        goal=(
+            'Define precise network architecture requirements for VPCs, subnets, route tables, '
+            'NAT gateways, and security groups as structured specifications. '
+            'Express WHAT to build and WHY — not Terraform code.'
+        ),
         backstory=_backstory(
-            'You are a network architect who has spent a decade designing secure, multi-AZ AWS network topologies. You always start with the network because everything else depends on it.',
+            'You are a network architect who has spent a decade designing secure, multi-AZ AWS '
+            'network topologies. You produce clear requirement specs that a Terraform author '
+            'can implement without ambiguity. You always specify CIDR blocks, AZ placement, '
+            'route table associations, and security group rules with source/destination precision.',
             additional_context,
         ),
         llm=llm,
@@ -46,9 +53,15 @@ def vpc_specialist(llm, additional_context: str | None = None):
 def ec2_specialist(llm, additional_context: str | None = None):
     return Agent(
         role='AWS EC2 Specialist',
-        goal='Design EC2 instances, AMIs, instance types, autoscaling groups, and launch templates.',
+        goal=(
+            'Define compute requirements for EC2 instances, autoscaling groups, and launch '
+            'templates as structured specifications. Express WHAT to build — not Terraform code.'
+        ),
         backstory=_backstory(
-            'You know AWS compute inside and out. You pick the right instance family, size, and AMI for the workload, and you always place instances in the appropriate subnets the networking team designed.',
+            'You know AWS compute inside and out. You pick the right instance family, size, '
+            'and AMI for the workload and specify exactly which subnets, security groups, '
+            'and IAM instance profiles the compute tier needs. You produce requirement specs '
+            'a Terraform author can implement without asking follow-up questions.',
             additional_context,
         ),
         llm=llm,
@@ -60,9 +73,15 @@ def ec2_specialist(llm, additional_context: str | None = None):
 def rds_specialist(llm, additional_context: str | None = None):
     return Agent(
         role='AWS RDS & Database Specialist',
-        goal='Design RDS instances, Aurora clusters, parameter groups, and backup strategies.',
+        goal=(
+            'Define database requirements for RDS instances and Aurora clusters as structured '
+            'specifications. Express WHAT to build — not Terraform code.'
+        ),
         backstory=_backstory(
-            'You have deep experience with managed AWS databases. You handle engine selection, multi-AZ deployments, encryption at rest, and read replicas.',
+            'You have deep experience with managed AWS databases. You specify engine, version, '
+            'instance class, multi-AZ, encryption, backup retention, parameter group needs, '
+            'and subnet group placement. You produce requirement specs a Terraform author can '
+            'implement directly.',
             additional_context,
         ),
         llm=llm,
@@ -74,9 +93,16 @@ def rds_specialist(llm, additional_context: str | None = None):
 def s3_specialist(llm, additional_context: str | None = None):
     return Agent(
         role='AWS S3 & Storage Specialist',
-        goal='Design S3 buckets, bucket policies, lifecycle rules, and storage classes.',
+        goal=(
+            'Define storage requirements for S3 buckets, policies, and lifecycle rules as '
+            'structured specifications. Express WHAT to build — not Terraform code.'
+        ),
         backstory=_backstory(
-            'You design S3 buckets for security, durability, and cost optimization. You always enable versioning, encryption, and access logging by default.',
+            'You design S3 configurations for security, durability, and cost optimisation. '
+            'You specify versioning, encryption type and key, public access settings, access '
+            'logging targets, lifecycle transitions, and bucket policies. You always require '
+            'versioning and encryption by default. You produce specs a Terraform author can '
+            'implement without guessing.',
             additional_context,
         ),
         llm=llm,
@@ -88,9 +114,16 @@ def s3_specialist(llm, additional_context: str | None = None):
 def iam_specialist(llm, additional_context: str | None = None):
     return Agent(
         role='AWS IAM & Security Specialist',
-        goal='Design IAM roles, policies, instance profiles, and trust relationships.',
+        goal=(
+            'Define access-control requirements for IAM roles, policies, and trust relationships '
+            'as structured specifications. Express WHAT to build — not Terraform code.'
+        ),
         backstory=_backstory(
-            'You enforce least-privilege access. You never grant wildcard permissions and you always scope policies to specific resources.',
+            'You enforce least-privilege access. You specify trust policies (who can assume a '
+            'role), permission policies (exact actions and resource ARNs or logical references), '
+            'and instance profile associations. You never grant wildcard permissions and always '
+            'scope to specific resources. You produce specs a Terraform author can implement '
+            'precisely.',
             additional_context,
         ),
         llm=llm,
@@ -102,9 +135,15 @@ def iam_specialist(llm, additional_context: str | None = None):
 def lambda_specialist(llm, additional_context: str | None = None):
     return Agent(
         role='AWS Lambda & Serverless Specialist',
-        goal='Design Lambda functions, runtimes, event sources, and IAM execution roles.',
+        goal=(
+            'Define serverless compute requirements for Lambda functions, event sources, and '
+            'execution roles as structured specifications. Express WHAT to build — not Terraform code.'
+        ),
         backstory=_backstory(
-            'You build serverless architectures. You pick the right memory/timeout settings, handle cold starts, and integrate Lambda with the rest of the AWS ecosystem.',
+            'You build serverless architectures. You specify runtime, memory, timeout, handler, '
+            'environment variables, event source mappings, VPC placement (if needed), and the '
+            'IAM permissions the execution role requires. You produce specs a Terraform author '
+            'can implement without ambiguity.',
             additional_context,
         ),
         llm=llm,
@@ -165,9 +204,9 @@ def go_specialist(llm, additional_context: str | None = None):
 # Maps short specialist ID → factory function.
 # Add new specialists here.
 
-# True  → specialist emits Terraform (HCL); the Terraform assembler should run.
-# False → specialist emits application code; assembler is not needed.
-SPECIALIST_PRODUCES_TERRAFORM = {
+# True  → AWS service specialist; outputs requirement specs for the Terraform specialist.
+# False → language specialist; outputs application code files directly.
+SPECIALIST_IS_AWS = {
     'vpc': True, 'ec2': True, 'rds': True, 's3': True, 'iam': True, 'lambda': True,
     'python': False, 'javascript': False, 'go': False,
 }

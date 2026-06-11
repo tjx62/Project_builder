@@ -8,6 +8,7 @@ prior tasks as context, so outputs flow downstream in handoff order.
 
 from crewai import Task
 from tools import build_resource_manifest
+from specialists import SPECIALIST_IS_AWS
 
 
 def build_wiring_review_task(reviewer, prior_tasks: list) -> Task:
@@ -50,7 +51,8 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
                 compliance_framework: str | None = None, key_controls: str = "",
                 existing_context: str | None = None,
                 audit_only: bool = False,
-                wiring_reviewer=None):
+                wiring_reviewer=None,
+                terraform_specialist_agent=None):
     """Build the full ordered task list for sequential execution.
 
     Args:
@@ -154,12 +156,22 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
         prior_tasks.append(architect_task)
 
     # --- 2. Each specialist runs in order ---
-    # Each specialist only receives the architect's output plus its immediate
-    # predecessor's output — not the full chain. This keeps context lean while
-    # still allowing each specialist to build on the prior one's work.
+    # AWS specialists (SPECIALIST_IS_AWS=True) output structured
+    # requirement specs — no HCL. Language specialists output code files directly
+    # as before. The Terraform specialist (step 2.5) then authors all .tf files
+    # from the AWS specs in one coherent pass. Each AWS specialist then runs a
+    # second time (step 2.6) to verify its own requirements were correctly
+    # implemented and fix any gaps in-place.
+    #
+    # Context chaining: each specialist gets [architect, last_specialist] to keep
+    # context lean. The Terraform specialist gets [architect + all AWS spec tasks].
     last_specialist_task = None
+    aws_spec_tasks = []
+    aws_specialist_info = []  # (specialist_id, agent) parallel to aws_spec_tasks
+
     for specialist_id, specialist in specialist_agents:
         specialist_context = [t for t in (architect_task, last_specialist_task) if t is not None]
+        is_aws = SPECIALIST_IS_AWS.get(specialist_id, False)
 
         manifest_block = (
             f"\n\nResources already defined in this project — reference these by their EXACT "
@@ -167,43 +179,141 @@ def build_tasks(architect, specialist_agents, auditor, project_request,
             if existing_manifest else ""
         )
 
-        specialist_task = Task(
-            description=(
-                f"You are the {specialist.role}. Implement your specific piece of the project.\n"
-                f"Original request: {project_request}\n"
-                f"{manifest_block}\n"
-                "Review the architect's brief and any prior specialist output in your context, "
-                "then produce your specific contribution. Build on prior outputs rather than redesigning them.\n\n"
-                "WIRING: If your component must access or be accessed by another resource, create the "
-                "necessary glue (IAM roles/policies, security-group rules, etc.) and reference other "
-                "resources by their EXACT address (as given in the design brief or the manifest above) — "
-                "never invent or guess resource names.\n\n"
-                "IMPORTANT: Be concise and structured. Output ONLY the essential code and configuration — "
-                "no lengthy explanations, no preamble, no commentary. "
-                "Label each file clearly as:\n"
-                "### File: <filename>\n```<language>\n<code>\n```\n"
-                "If your output is Terraform, use ```hcl. If Python, use ```python. Etc.\n"
-                f"NAMING: If writing Terraform, name your primary file `{specialist_id}.tf` "
-                f"(not `main.tf`) so each specialist's output stays separate and nothing is overwritten.\n"
-                "Do NOT emit variables.tf or outputs.tf — those are generated automatically "
-                "from your resource files. Only emit your resource file.\n"
-                "SHARED DATA SOURCES: if you need data sources that other specialists also "
-                "use (e.g. aws_caller_identity, aws_region, aws_availability_zones), define "
-                "them ONLY if you are certain no other specialist in this project will also "
-                "define them. Prefer referencing them via a variable or output instead of "
-                "repeating the data block. When in doubt, leave them out — the architect's "
-                "brief will indicate which specialist owns each shared data source."
-            ),
-            expected_output=(
-                f"Concise {specialist_id} implementation with each file labelled as "
-                "'### File: <filename>' followed by its code in a fenced block. No prose explanations."
-            ),
-            agent=specialist,
-            context=specialist_context
-        )
+        if is_aws:
+            specialist_task = Task(
+                description=(
+                    f"You are the {specialist.role}. Define the requirements for your part of the project.\n"
+                    f"Original request: {project_request}\n"
+                    f"{manifest_block}\n"
+                    "Review the architect's brief and any prior specialist output in your context, "
+                    "then produce structured requirement specifications for your AWS resources.\n\n"
+                    "IMPORTANT: Do NOT write Terraform or any code. Output requirement specs only — "
+                    "describe WHAT to build and its properties. A dedicated Terraform specialist will "
+                    "author the HCL from your specs.\n\n"
+                    "Format each resource as:\n"
+                    "### Spec: <Resource Category>\n"
+                    "- Resource type: <aws_resource_type>\n"
+                    "- Logical name: <terraform_resource_name>\n"
+                    "- <property>: <value>\n"
+                    "...\n\n"
+                    "Include all required properties, security settings, cross-resource dependencies "
+                    "(name the other resource's logical name/type), and any IAM permissions required. "
+                    "Be precise — the Terraform specialist implements exactly what you specify."
+                ),
+                expected_output=(
+                    f"Structured requirement specs for all {specialist_id} resources, each labeled "
+                    "'### Spec: <category>' with property bullets. No code, no HCL."
+                ),
+                agent=specialist,
+                context=specialist_context,
+            )
+            aws_spec_tasks.append(specialist_task)
+            aws_specialist_info.append((specialist_id, specialist))
+        else:
+            specialist_task = Task(
+                description=(
+                    f"You are the {specialist.role}. Implement your specific piece of the project.\n"
+                    f"Original request: {project_request}\n"
+                    f"{manifest_block}\n"
+                    "Review the architect's brief and any prior specialist output in your context, "
+                    "then produce your specific contribution. Build on prior outputs rather than redesigning them.\n\n"
+                    "IMPORTANT: Be concise and structured. Output ONLY the essential code — "
+                    "no lengthy explanations, no preamble, no commentary. "
+                    "Label each file clearly as:\n"
+                    "### File: <filename>\n```<language>\n<code>\n```\n"
+                    f"Name your primary file after its purpose (e.g. `{specialist_id}_handler.py`, "
+                    "`index.ts`, etc.) — not `main` — so files stay distinct.\n"
+                ),
+                expected_output=(
+                    f"Concise {specialist_id} implementation with each file labelled as "
+                    "'### File: <filename>' followed by its code in a fenced block. No prose explanations."
+                ),
+                agent=specialist,
+                context=specialist_context,
+            )
+
         all_tasks.append(specialist_task)
         prior_tasks.append(specialist_task)
         last_specialist_task = specialist_task
+
+    # --- 2.5. Terraform specialist: author HCL from AWS requirement specs ---
+    # Runs only when there are AWS specialists and a terraform_specialist_agent was
+    # provided. Gets [architect + all AWS spec tasks] as context so it sees every
+    # requirement in one pass and can wire resources across service boundaries.
+    # outputs.tf and variables.tf are still generated in pure Python at commit time.
+    terraform_task = None
+    if aws_spec_tasks and terraform_specialist_agent is not None:
+        tf_context = ([architect_task] if architect_task else []) + aws_spec_tasks
+        terraform_task = Task(
+            description=(
+                f"Original request: {project_request}\n\n"
+                "Read every '### Spec:' block from the AWS specialists in your context and "
+                "author a complete, coherent set of Terraform (.tf) files that implements "
+                "ALL specified requirements.\n\n"
+                "Rules:\n"
+                "- One file per service domain: vpc.tf, ec2.tf, s3.tf, iam.tf, lambda.tf, rds.tf, etc.\n"
+                "- ALL cross-resource references MUST use Terraform attribute expressions "
+                "(e.g. aws_s3_bucket.app_logs.arn) — never hardcoded strings\n"
+                "- Define shared data sources (aws_caller_identity, aws_region, "
+                "aws_availability_zones) ONCE across all files — no duplicates\n"
+                "- Do NOT emit variables.tf or outputs.tf — generated automatically\n"
+                "- Every resource in every spec must appear in the output\n"
+                "- Use the logical names from the specs as your Terraform resource labels\n\n"
+                + (
+                    f"Resources already on disk (do NOT redefine these):\n{existing_manifest}\n\n"
+                    if existing_manifest else ""
+                )
+                + "Output each file as:\n"
+                "### File: <filename>\n```hcl\n<content>\n```"
+            ),
+            expected_output=(
+                "A complete set of Terraform files, each labeled '### File: <filename>' with HCL. "
+                "Every requirement spec implemented. No variables.tf or outputs.tf."
+            ),
+            agent=terraform_specialist_agent,
+            context=tf_context,
+        )
+        all_tasks.append(terraform_task)
+        prior_tasks.append(terraform_task)
+
+    # --- 2.6. Per-specialist verification pass ---
+    # Each AWS specialist re-runs to verify its OWN requirement specs were correctly
+    # implemented in the Terraform files. The specialist has the domain knowledge to
+    # judge whether its spec was satisfied — the S3 specialist knows what correct S3
+    # config looks like, the IAM specialist knows what a least-privilege policy should
+    # look like, etc.
+    #
+    # Each specialist gets [its own spec task + terraform_task] as context and
+    # fixes any gap it finds directly in the relevant file — same pattern as the
+    # compliance auditor (review + fix in one step, emit only changed files).
+    if terraform_task is not None and aws_specialist_info:
+        for (sid, specialist), spec_task in zip(aws_specialist_info, aws_spec_tasks):
+            verify_task = Task(
+                description=(
+                    f"You are the {specialist.role}. Verify that the Terraform files correctly "
+                    f"implement YOUR requirements from the '{sid}' spec.\n\n"
+                    "Your original requirement spec is in your context. "
+                    "The Terraform files are also in your context.\n\n"
+                    "For each requirement bullet in your spec:\n"
+                    "- ✅ if it is correctly implemented in the HCL\n"
+                    "- ❌ if it is missing, incorrect, or incomplete — then fix it directly "
+                    "in the relevant Terraform file\n\n"
+                    "Output:\n"
+                    f"1. '## Verification: {sid}' section — one ✅/❌ line per requirement\n"
+                    "2. ONLY the Terraform files you changed, as '### File: <filename>' "
+                    "fenced HCL blocks\n"
+                    "If all your requirements were satisfied, output only the verification "
+                    "section with no file blocks. Do NOT re-emit unchanged files."
+                ),
+                expected_output=(
+                    f"A '## Verification: {sid}' section with one ✅/❌ line per requirement, "
+                    "followed by only the files changed. No unchanged files."
+                ),
+                agent=specialist,
+                context=[spec_task, terraform_task],
+            )
+            all_tasks.append(verify_task)
+            prior_tasks.append(verify_task)
 
     # NOTE: outputs.tf and variables.tf are generated in pure Python from the
     # resource files at commit time (see tools.generate_outputs /
