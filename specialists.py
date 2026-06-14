@@ -12,7 +12,7 @@ To add a new specialist:
        knows when to pick it.
 """
 
-from crewai import Agent
+from executor import AgentSpec
 
 
 _DEFAULT_CONTEXT = "No additional organizational context provided."
@@ -29,8 +29,8 @@ def _backstory(base: str, additional_context: str | None) -> str:
 # AWS SPECIALISTS
 # ==========================================
 
-def vpc_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def vpc_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='AWS VPC & Networking Specialist',
         goal=(
             'Define precise network architecture requirements for VPCs, subnets, route tables, '
@@ -44,14 +44,13 @@ def vpc_specialist(llm, additional_context: str | None = None):
             'route table associations, and security group rules with source/destination precision.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def ec2_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def ec2_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='AWS EC2 Specialist',
         goal=(
             'Define compute requirements for EC2 instances, autoscaling groups, and launch '
@@ -64,14 +63,13 @@ def ec2_specialist(llm, additional_context: str | None = None):
             'a Terraform author can implement without asking follow-up questions.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def rds_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def rds_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='AWS RDS & Database Specialist',
         goal=(
             'Define database requirements for RDS instances and Aurora clusters as structured '
@@ -84,14 +82,13 @@ def rds_specialist(llm, additional_context: str | None = None):
             'implement directly.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def s3_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def s3_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='AWS S3 & Storage Specialist',
         goal=(
             'Define storage requirements for S3 buckets, policies, and lifecycle rules as '
@@ -105,14 +102,13 @@ def s3_specialist(llm, additional_context: str | None = None):
             'implement without guessing.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def iam_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def iam_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='AWS IAM & Security Specialist',
         goal=(
             'Define access-control requirements for IAM roles, policies, and trust relationships '
@@ -126,14 +122,13 @@ def iam_specialist(llm, additional_context: str | None = None):
             'precisely.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def lambda_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def lambda_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='AWS Lambda & Serverless Specialist',
         goal=(
             'Define serverless compute requirements for Lambda functions, event sources, and '
@@ -146,9 +141,8 @@ def lambda_specialist(llm, additional_context: str | None = None):
             'can implement without ambiguity.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
@@ -156,45 +150,42 @@ def lambda_specialist(llm, additional_context: str | None = None):
 # LANGUAGE SPECIALISTS
 # ==========================================
 
-def python_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def python_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='Senior Python Developer',
         goal='Write idiomatic, well-tested Python code following PEP 8 and modern best practices.',
         backstory=_backstory(
             'You have written production Python for over a decade. You favor explicit over implicit, use type hints, and structure code into clean modules.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def javascript_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def javascript_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='Senior JavaScript/TypeScript Developer',
         goal='Write modern JavaScript and TypeScript code following current best practices.',
         backstory=_backstory(
             'You build production Node.js services and frontend applications. You prefer TypeScript, async/await over callbacks, and modern ES module syntax.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
-def go_specialist(llm, additional_context: str | None = None):
-    return Agent(
+def go_specialist(tier, model, additional_context: str | None = None):
+    return AgentSpec(
         role='Senior Go Developer',
         goal='Write idiomatic Go code following effective Go principles.',
         backstory=_backstory(
             'You write production Go services. You favor simplicity, explicit error handling, and standard library solutions over third-party dependencies.',
             additional_context,
         ),
-        llm=llm,
-        allow_delegation=False,
-        max_iter=3
+        tier=tier,
+        model=model,
     )
 
 
