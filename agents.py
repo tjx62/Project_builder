@@ -2,14 +2,17 @@
 Supporting agents that wrap around the dynamically-selected specialists.
 
 These run on every project regardless of which specialists were chosen:
-    - manager:            Orchestrates the pipeline and handles feedback loops.
     - architect:          Designs the overall solution before specialists implement pieces.
     - compliance_auditor: Reviews the final output for FedRAMP compliance.
-    - git_specialist:     Writes the result to disk and commits it.
+    - wiring_reviewer:    Fixes cross-resource references to use Terraform attributes.
+    - terraform_specialist: Authors all HCL from the AWS specialists' requirement specs.
+    - remediation_engineer: Surgical fixer for auto-iterate rounds 2+.
+
+Each factory returns an executor.AgentSpec (a system-prompt template bound to a model
+tier). The git step and outputs.tf/variables.tf generation are pure Python (tools.py).
 """
 
-from crewai import Agent
-from tools import write_file_tool, git_commit_tool
+from executor import AgentSpec
 
 
 _DEFAULT_CONTEXT = "No additional organizational context provided."
@@ -23,60 +26,19 @@ def _with_context(backstory: str, additional_context: str | None) -> str:
 
 
 class SupportingAgents:
-    def __init__(self, llm, additional_context: str | None = None):
-        self.llm = llm
+    """Factory for the non-specialist agents, bound to one model tier/id."""
+
+    def __init__(self, tier: str, model: str, additional_context: str | None = None):
+        self.tier = tier
+        self.model = model
         self.additional_context = additional_context
 
-    def manager(self, specialist_agents=None):
-        """The hierarchical manager that coordinates the pipeline and handles
-        feedback loops between the auditor and specialists.
+    def _spec(self, role: str, goal: str, backstory: str) -> AgentSpec:
+        return AgentSpec(role=role, goal=goal, backstory=backstory,
+                         tier=self.tier, model=self.model)
 
-        Args:
-            specialist_agents: Optional list of (specialist_id, Agent) tuples so
-                               the manager knows which coworkers are available.
-        """
-        # Build the coworker list dynamically so the manager knows exactly
-        # which role names it can delegate to. Reduces hallucinated role names.
-        fixed_coworkers = [
-            '"Enterprise Solutions Architect"',
-            '"FedRAMP Rev 5 High Compliance Auditor"',
-            '"DevSecOps & CI/CD Engineer"',
-        ]
-        specialist_coworkers = (
-            [f'"{agent.role}"' for _, agent in specialist_agents]
-            if specialist_agents else []
-        )
-        all_coworkers = ", ".join(fixed_coworkers + specialist_coworkers)
-
-        return Agent(
-            role='Chief Technical Project Manager',
-            goal=(
-                'Orchestrate the full delivery pipeline in the correct order: '
-                'architect first, then specialists in dependency order (networking before compute, '
-                'compute before storage, etc.), then auditor, then git committer. '
-                'If the auditor flags compliance issues, delegate corrections back to the '
-                'relevant specialist before proceeding to commit. '
-                'ALWAYS provide all three fields when delegating: '
-                '"task" (what to do), "context" (all relevant prior output), '
-                f'"coworker" (exact role name). Available coworkers: {all_coworkers}. '
-                'When delegating to "DevSecOps & CI/CD Engineer", copy the COMPLETE '
-                'auditor output into the context field — every "### File: <filename>" '
-                'section and its code block. The git specialist cannot write files without them.'
-            ),
-            backstory=_with_context(
-                'You are a principal engineer who runs tight, well-coordinated delivery pipelines. '
-                'You never skip the audit step and always ensure flagged issues are corrected '
-                'before the git specialist writes files. You never delegate without providing '
-                'full context so coworkers have everything they need.',
-                self.additional_context,
-            ),
-            llm=self.llm,
-            allow_delegation=True,
-            max_iter=7
-        )
-
-    def architect(self):
-        return Agent(
+    def architect(self) -> AgentSpec:
+        return self._spec(
             role='Enterprise Solutions Architect',
             goal='Design the overall solution at a high level before specialists implement individual pieces.',
             backstory=_with_context(
@@ -85,14 +47,10 @@ class SupportingAgents:
                 'concerns at design time so the implementation phase has fewer rework cycles.',
                 self.additional_context,
             ),
-            llm=self.llm,
-            allow_delegation=False,
-            max_iter=3
         )
 
     def compliance_auditor(self, framework: str = "FedRAMP Rev 5 High",
-                           key_controls: str = "", llm_override=None,
-                           report_only: bool = False):
+                           key_controls: str = "", report_only: bool = False) -> AgentSpec:
         role = f"{framework} Compliance Auditor"
         controls_line = (f"Key controls to enforce: {key_controls}."
                          if key_controls else "Apply generally accepted security best practices.")
@@ -120,7 +78,6 @@ class SupportingAgents:
                 'is wrong and what must change so developers can act on your findings.',
                 self.additional_context,
             )
-            max_iter = 3
         else:
             goal = (
                 f'Review the assembled output against {framework} requirements and apply any '
@@ -141,18 +98,10 @@ class SupportingAgents:
                 'from other agents — you apply the fix and emit the result.',
                 self.additional_context,
             )
-            max_iter = 4
 
-        return Agent(
-            role=role,
-            goal=goal,
-            backstory=backstory,
-            llm=llm_override or self.llm,
-            allow_delegation=False,
-            max_iter=max_iter,
-        )
+        return self._spec(role=role, goal=goal, backstory=backstory)
 
-    def wiring_reviewer(self, llm_override=None):
+    def wiring_reviewer(self) -> AgentSpec:
         """Post-generation reviewer that enforces Terraform attribute references.
 
         Runs after all specialists and the compliance auditor on every full-generation
@@ -162,7 +111,7 @@ class SupportingAgents:
         (resource_type.resource_name.attribute) is available in the same config,
         and replace it. Compliance is out of scope — the auditor handles that.
         """
-        return Agent(
+        return self._spec(
             role="Terraform Wiring Reviewer",
             goal=(
                 "Review all Terraform files and fix every cross-resource reference that "
@@ -193,13 +142,46 @@ class SupportingAgents:
                 "at plan time, making dependencies explicit and plan-verifiable.",
                 self.additional_context,
             ),
-            llm=llm_override or self.llm,
-            allow_delegation=False,
-            max_iter=3,
+        )
+
+    def terraform_specialist(self) -> AgentSpec:
+        """Authors all Terraform HCL from AWS specialist requirement specs.
+
+        Runs after all AWS specialists have produced their structured requirement
+        specs. Its job is to translate those specs into one coherent set of .tf
+        files, ensuring consistent naming, correct attribute references, and no
+        duplicate data sources.
+        """
+        return self._spec(
+            role="Terraform IaC Specialist",
+            goal=(
+                "Read all AWS specialist requirement specs and author a complete, coherent set "
+                "of Terraform (.tf) files that implements every specified requirement.\n\n"
+                "Rules:\n"
+                "- One file per service domain: vpc.tf, ec2.tf, s3.tf, iam.tf, lambda.tf, rds.tf, etc.\n"
+                "- ALL cross-resource references MUST use Terraform attribute expressions "
+                "(e.g. aws_s3_bucket.app_logs.arn), never hardcoded strings or reconstructed values\n"
+                "- Define shared data sources (aws_caller_identity, aws_region, "
+                "aws_availability_zones) ONCE across all files — no duplicates\n"
+                "- Do NOT emit variables.tf or outputs.tf — those are generated automatically\n"
+                "- Every resource named in the specs must appear in the output\n"
+                "- Be explicit: include all required arguments, no placeholders\n\n"
+                "Output each file as:\n"
+                "### File: <filename>\n```hcl\n<content>\n```"
+            ),
+            backstory=_with_context(
+                "You are a Terraform expert who specialises in translating architecture "
+                "requirement specs into clean, correct HCL. You know exactly how to wire "
+                "AWS resources together — IAM roles to instance profiles, security group "
+                "rules between tiers, KMS keys to encrypted resources — and you always use "
+                "Terraform attribute references rather than hardcoded values so that Terraform "
+                "can plan and validate the dependency graph correctly.",
+                self.additional_context,
+            ),
         )
 
     def remediation_engineer(self, framework: str = "FedRAMP Rev 5 High",
-                             key_controls: str = "", llm_override=None):
+                             key_controls: str = "") -> AgentSpec:
         """A surgical fixer for auto-iterate rounds 2+.
 
         Given a findings list and the current content of only the affected files,
@@ -208,7 +190,7 @@ class SupportingAgents:
         """
         controls_line = (f"Key controls to enforce: {key_controls}."
                          if key_controls else "Apply generally accepted security best practices.")
-        return Agent(
+        return self._spec(
             role=f"{framework} Remediation Engineer",
             goal=(
                 f'Apply specific {framework} audit fixes to existing files. {controls_line} '
@@ -224,47 +206,4 @@ class SupportingAgents:
                 'and emit only the files you touched.',
                 self.additional_context,
             ),
-            llm=llm_override or self.llm,
-            allow_delegation=False,
-            max_iter=3,
-        )
-
-    def terraform_assembler(self):
-        return Agent(
-            role='Terraform Assembler',
-            goal=(
-                'Read all Terraform resource files produced by the specialists and generate '
-                'a single outputs.tf file that exposes the most useful attributes of every '
-                'resource created. Output ONLY the outputs.tf file — do not rewrite or '
-                'repeat any resource files. Use this exact format:\n'
-                '### File: outputs.tf\n```hcl\n<outputs>\n```\n\n'
-                'For each resource include: id, arn, and 1–2 other commonly needed attributes '
-                '(e.g. bucket_domain_name for S3, invoke_arn for Lambda, endpoint for RDS).\n'
-                'If there are no Terraform resources in the context, output nothing.'
-            ),
-            backstory=_with_context(
-                'You are a Terraform expert who writes clean, minimal outputs.tf files. '
-                'You know exactly which attributes are most useful for each AWS resource type. '
-                'You never duplicate resource definitions — you only add the outputs layer.',
-                self.additional_context,
-            ),
-            llm=self.llm,
-            allow_delegation=False,
-            max_iter=2,
-        )
-
-    def git_specialist(self):
-        return Agent(
-            role='DevSecOps & CI/CD Engineer',
-            goal='Save the compliant code to the file system and commit it safely.',
-            backstory=_with_context(
-                'You manage local files and git operations meticulously. You write every file '
-                'exactly as specified, never paraphrase code, and you commit with concise '
-                'descriptive messages that summarise the change.',
-                self.additional_context,
-            ),
-            llm=self.llm,
-            tools=[write_file_tool, git_commit_tool],
-            allow_delegation=False,
-            max_iter=5  # Git committer just calls tools — few iterations needed.
         )

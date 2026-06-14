@@ -6,16 +6,9 @@ import re
 import os
 import queue
 import threading
-import logging
 import time
-from crewai import Crew, Process, LLM
-from crewai.events.event_bus import crewai_event_bus
-from crewai.events.types.agent_events import (
-    AgentExecutionStartedEvent,
-    AgentExecutionCompletedEvent,
-)
-from crewai.events.types.llm_events import LLMCallCompletedEvent
 
+from executor import build_client, run_pipeline, StepSpec
 from config import (
     BEDROCK_MODEL_IDS, ANTHROPIC_MODEL_IDS,
     TIER_OPTIONS, TIER_COLORS, TIER_ICONS,
@@ -24,11 +17,12 @@ from config import (
     detect_provider_type, load_credentials_from_env,
     inject_credentials_from_config, write_env_provider,
     read_dark_mode, write_dark_mode,
+    read_prompt_caching, write_prompt_caching,
 )
-from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS
+from specialists import SPECIALISTS, SPECIALIST_DESCRIPTIONS, SPECIALIST_IS_AWS
 from planner import plan_specialists
 from agents import SupportingAgents
-from tasks import build_tasks, build_remediation_tasks, build_wiring_review_task
+from tasks import build_tasks, build_remediation_tasks
 from tools import (
     commit_audited_output, read_workspace_context, write_findings,
     parse_finding_files, read_specific_files,
@@ -119,40 +113,6 @@ st.title("🏗️ Adaptive AI Code Builder")
 st.markdown("Specialists chosen on the fly based on your project request.")
 
 
-# --- Queue-based log capture ---
-# CrewAI routes verbose output through Python logging (not print), so we
-# need both a stdout redirector and a logging handler to capture everything.
-
-class QueueLogHandler(logging.Handler):
-    """Intercepts Python logging records and puts them in the queue.
-    This is what actually captures CrewAI's verbose output in newer versions."""
-    def __init__(self, log_queue):
-        super().__init__()
-        self.log_queue = log_queue
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            clean = re.sub(r'\x1b\[[0-9;]*m', '', msg)
-            if clean.strip():
-                self.log_queue.put(clean)
-        except Exception:
-            pass
-
-
-class QueueCapture:
-    def __init__(self, log_queue):
-        self.log_queue = log_queue
-
-    def write(self, text):
-        clean_text = re.sub(r'\x1b\[[0-9;]*m', '', text)
-        if clean_text.strip():
-            self.log_queue.put(clean_text)
-
-    def flush(self):
-        pass
-
-
 def _is_wsl() -> bool:
     try:
         with open("/proc/version") as f:
@@ -176,11 +136,18 @@ def _pick_directory(initial_dir: str = ".") -> str | None:
         init_clause = f"$d.SelectedPath = '{win_init}'; " if win_init else ""
         ps = (
             "Add-Type -AssemblyName System.Windows.Forms; "
+            # Invisible top-most owner window forces the dialog to the front on WSL2
+            # where there is no parent HWND to give it focus automatically.
+            "$owner = New-Object System.Windows.Forms.Form; "
+            "$owner.TopMost = $true; $owner.StartPosition = 'CenterScreen'; "
+            "$owner.Width = 0; $owner.Height = 0; $owner.ShowInTaskbar = $false; "
+            "$owner.Show(); $owner.Hide(); "
             "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
             "$d.Description = 'Select project directory'; "
             "$d.ShowNewFolderButton = $true; "
             + init_clause
-            + "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
+            + "if ($d.ShowDialog($owner) -eq 'OK') { Write-Output $d.SelectedPath }; "
+            "$owner.Dispose()"
         )
         try:
             result = subprocess.run(
@@ -576,6 +543,7 @@ def _settings_dialog():
             st.stop()
 
 
+
 # ==========================================
 # 3. SIDEBAR — global config (always visible)
 # ==========================================
@@ -631,6 +599,17 @@ with st.sidebar:
         help="Auditor reviews output against this framework. 'None' skips the audit step entirely.",
     )
 
+    _caching = st.toggle(
+        "Prompt Caching",
+        value=read_prompt_caching(),
+        help=(
+            "Cache writes cost 125% of the input rate; reads cost 10%. "
+            "Only beneficial for auto-iterate runs with a large org-context doc."
+        ),
+    )
+    if _caching != read_prompt_caching():
+        write_prompt_caching(_caching)
+
     project_path = st.session_state.project_path
 
     if st.button("🔄 Start Over"):
@@ -645,14 +624,7 @@ with st.sidebar:
 
 
 # ==========================================
-# LLM TIERS — three models, each matched to the complexity of its role.
-#
-#   Haiku   → planner (classification only, fast and cheap)
-#   Sonnet  → specialists + wiring reviewer (implementation, instruction-following)
-#   Opus    → architect + auditors (high-stakes reasoning and compliance review)
-#
-# Provider and credentials are read from session state so changes in Settings
-# take effect immediately without an app restart.
+# CLIENT + MODEL HELPERS
 # ==========================================
 _is_bedrock = st.session_state.provider_type in ("bedrock_sso", "bedrock_keys")
 _model_ids  = BEDROCK_MODEL_IDS if _is_bedrock else ANTHROPIC_MODEL_IDS
@@ -661,20 +633,17 @@ _api_key    = (
     else (st.session_state.provider_credentials.get("api_key") or os.environ.get("ANTHROPIC_API_KEY"))
 )
 
-_llm_kwargs = {"temperature": 0.2, "max_tokens": 8192}
-if not _is_bedrock:
-    _llm_kwargs["api_key"] = _api_key
-
-haiku_llm  = LLM(model=_model_ids["haiku"],  **_llm_kwargs)
-sonnet_llm = LLM(model=_model_ids["sonnet"], **_llm_kwargs)
-opus_llm   = LLM(model=_model_ids["opus"],   **_llm_kwargs)
-
-_TIER_LLMS = {"haiku": haiku_llm, "sonnet": sonnet_llm, "opus": opus_llm}
+_client = build_client(
+    is_bedrock=_is_bedrock,
+    api_key=_api_key,
+    aws_region=st.session_state.provider_credentials.get("aws_region"),
+)
 
 
-def _llm_for(role_key: str) -> LLM:
+def _model_for(role_key: str) -> str:
+    """Return the resolved model id (with provider prefix) for a role."""
     tier = st.session_state.model_assignments.get(role_key, DEFAULT_MODEL_ASSIGNMENTS[role_key])
-    return _TIER_LLMS.get(tier, haiku_llm)
+    return _model_ids.get(tier, _model_ids["haiku"])
 
 
 def _tier_for(role_key: str) -> str:
@@ -744,9 +713,10 @@ if st.session_state.phase == "input":
                     with st.spinner("Planner is analyzing the request..."):
                         try:
                             st.session_state.plan = plan_specialists(
-                                llm=_llm_for("planner"),
+                                client=_client,
+                                model=_model_for("planner"),
                                 project_request=st.session_state.project_request,
-                                additional_context=st.session_state.context_text
+                                additional_context=st.session_state.context_text,
                             )
                             st.session_state.phase = "confirm"
                             st.rerun()
@@ -838,6 +808,11 @@ elif st.session_state.phase == "execute":
             f"fresh input **{fresh:,}** · output **{out:,}** · "
             f"hit rate **{hit_rate:.0f}%**"
         )
+        if cc_total > 0 and cr_total == 0:
+            st.caption(
+                "💸 Caching had **0 hits** this run — cache writes added cost with no benefit. "
+                "Consider disabling **Prompt Caching** in the sidebar for runs like this."
+            )
 
         with st.expander("📊 Per-model breakdown"):
             for tier, t in tokens.items():
@@ -896,6 +871,41 @@ elif st.session_state.phase == "execute":
             st.rerun()
         st.stop()
 
+    # --- Cache advisor: show a tip before the pipeline starts ---
+    # Evaluate whether prompt caching is likely to help or hurt for this run.
+    # Score-based: auto-iterate + large context + Sonnet/Opus → likely helpful;
+    # all-Haiku single-pass → likely costs more than it saves.
+    if not st.session_state.pipeline_running and not st.session_state.pipeline_done:
+        _cache_on = read_prompt_caching()
+        _ma = st.session_state.model_assignments
+        _all_haiku = all(_ma.get(r, "haiku") == "haiku" for r in ["specialist", "terraform_specialist", "auditor", "architect"])
+        _any_upper = any(_ma.get(r, "haiku") in ("sonnet", "opus") for r in ["specialist", "terraform_specialist", "auditor", "architect"])
+        _ctx_tokens = len(st.session_state.context_text or "") // 4
+        _score = 0
+        if st.session_state.auto_iterate and st.session_state.max_rounds >= 2:
+            _score += 1
+        if _ctx_tokens > 500:
+            _score += 1
+        if _any_upper:
+            _score += 1
+        if _all_haiku:
+            _score -= 1
+        if _cache_on and _score < 0:
+            st.warning(
+                "⚠️ **Prompt caching is on** but unlikely to save money on this run "
+                "(all-Haiku, single-pass, small context). "
+                "Cache writes cost 25% extra when hits are zero. "
+                "Disable via the **Prompt Caching** toggle in the sidebar.",
+                icon=None,
+            )
+        elif not _cache_on and _score >= 2:
+            st.info(
+                "💡 **Prompt caching is off.** This run (auto-iterate + Sonnet/Opus or large "
+                "org context) is a good candidate — enabling it could reduce costs. "
+                "Toggle **Prompt Caching** in the sidebar.",
+                icon=None,
+            )
+
     # --- First entry: build and launch the crew in a background thread ---
     # pipeline_running stays False until the thread is started, so this block
     # runs exactly once per pipeline execution even as Streamlit reruns the
@@ -918,14 +928,11 @@ elif st.session_state.phase == "execute":
         existing_file_count = existing_context.count("### File:") if existing_context else 0
         st.session_state._existing_file_count = existing_file_count
 
-        auditor_llm  = _llm_for("auditor")
-        reviewer_llm = _llm_for("wiring_reviewer")
-        architect_llm = _llm_for("architect")
-
-        support_architect = SupportingAgents(architect_llm, additional_context=context_text)
-        support_auditor   = SupportingAgents(auditor_llm,   additional_context=context_text)
-        support_reviewer  = SupportingAgents(reviewer_llm,  additional_context=context_text)
-        support_remediation = SupportingAgents(_llm_for("remediation"), additional_context=context_text)
+        support_architect   = SupportingAgents(_tier_for("architect"),            _model_for("architect"),            context_text)
+        support_auditor     = SupportingAgents(_tier_for("auditor"),              _model_for("auditor"),              context_text)
+        support_reviewer    = SupportingAgents(_tier_for("wiring_reviewer"),      _model_for("wiring_reviewer"),      context_text)
+        support_remediation = SupportingAgents(_tier_for("remediation"),          _model_for("remediation"),          context_text)
+        support_terraform   = SupportingAgents(_tier_for("terraform_specialist"), _model_for("terraform_specialist"), context_text)
 
         is_auto_iterate = st.session_state.auto_iterate
         max_rounds      = st.session_state.max_rounds
@@ -933,91 +940,102 @@ elif st.session_state.phase == "execute":
         if is_audit_only:
             # ── Audit-only: Auditor → Write Findings ───────────────────────
             auditor = support_auditor.compliance_auditor(
-                framework=framework_name, key_controls=key_controls,
-                llm_override=auditor_llm, report_only=True,
+                framework=framework_name, key_controls=key_controls, report_only=True,
             )
             pipeline     = [("Auditor", "auditor", auditor), ("Write Findings", "python", None)]
             findings_idx = 1
-            crew_agents  = [auditor]
+            role_to_card_idx = {auditor.role: 0}
             tasks = build_tasks(
                 architect=None, specialist_agents=[], auditor=auditor,
                 project_request=st.session_state.project_request,
                 compliance_framework=framework_name, key_controls=key_controls,
                 existing_context=existing_context, audit_only=True,
+                role_to_card_idx=role_to_card_idx,
             )
 
         elif is_auto_iterate:
-            # ── Auto-iterate: crew + tasks built fresh each round inside thread ──
+            # ── Auto-iterate: StepSpec lists built fresh each round inside thread ──
             specialist_agents = [
-                (sid, SPECIALISTS[sid](_llm_for("specialist"), additional_context=context_text))
+                (sid, SPECIALISTS[sid](_tier_for("specialist"), _model_for("specialist"), context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
-            architect    = support_architect.architect() if use_architect else None
-            # Inline auditor applies compliance fixes during round-1 full pass.
-            # Report auditor verifies compliance after each round.
-            # Fixer applies targeted fixes in rounds 2+.
-            # Wiring reviewer checks cross-resource references after generation.
+            architect     = support_architect.architect() if use_architect else None
+            has_terraform = any(
+                SPECIALIST_IS_AWS.get(sid, False)
+                for sid in st.session_state.confirmed_ids
+            )
+            terraform_specialist_agent = (
+                support_terraform.terraform_specialist() if has_terraform else None
+            )
             inline_auditor = support_auditor.compliance_auditor(
-                framework=framework_name, key_controls=key_controls,
-                llm_override=auditor_llm, report_only=False,
+                framework=framework_name, key_controls=key_controls, report_only=False,
             )
             report_auditor = support_auditor.compliance_auditor(
+                framework=framework_name, key_controls=key_controls, report_only=True,
+            )
+            fixer           = support_remediation.remediation_engineer(
                 framework=framework_name, key_controls=key_controls,
-                llm_override=auditor_llm, report_only=True,
             )
-            fixer = support_remediation.remediation_engineer(
-                framework=framework_name, key_controls=key_controls,
-                llm_override=_llm_for("remediation"),
-            )
-            wiring_reviewer = support_reviewer.wiring_reviewer(llm_override=reviewer_llm)
-            generate_crew_agents = (
-                ([architect] if architect else [])
-                + [agent for _, agent in specialist_agents]
-                + [inline_auditor]
-                + [wiring_reviewer]
-            )
+            wiring_reviewer = support_reviewer.wiring_reviewer()
             pipeline = (
-                ([("Architect", "architect", architect)] if architect else [])
-                + [(sid.upper(), "specialist", agent) for sid, agent in specialist_agents]
-                + [("Auditor", "auditor", inline_auditor)]
-                + [("Wiring Review", "wiring_reviewer", wiring_reviewer)]
-                + [("Git", "python", None)]
+                ([("Architect",      "architect",            architect)]                  if architect              else [])
+                + [(sid.upper(),     "specialist",           agent)                       for sid, agent in specialist_agents]
+                + ([("Terraform",    "terraform_specialist", terraform_specialist_agent)] if terraform_specialist_agent else [])
+                + [("Auditor",       "auditor",              inline_auditor)]
+                + [("Wiring Review", "wiring_reviewer",      wiring_reviewer)]
+                + [("Git",           "python",               None)]
             )
             findings_idx = None
-            crew_agents  = generate_crew_agents   # for role_to_idx only
-            tasks        = []  # built inside run_crew each round
+            # role → card index used by build_tasks for ACTIVE/DONE sentinels.
+            # fixer maps to the Auditor card (rounds 2+).
+            role_to_card_idx = {
+                agent_obj.role: i
+                for i, (_lbl, _rk, agent_obj) in enumerate(pipeline)
+                if agent_obj is not None
+            }
+            auditor_card_idx = next(
+                i for i, (lbl, _, _) in enumerate(pipeline) if lbl == "Auditor"
+            )
+            role_to_card_idx[fixer.role] = auditor_card_idx
+            tasks = []  # built inside run_pipeline_thread each round
 
         else:
-            # ── Normal: (Architect) → Specialists → (Auditor) → Wiring Review → Git ──
+            # ── Normal: (Architect) → Specialists → (Terraform) → (Auditor) → Wiring Review → Git ──
             specialist_agents = [
-                (sid, SPECIALISTS[sid](_llm_for("specialist"), additional_context=context_text))
+                (sid, SPECIALISTS[sid](_tier_for("specialist"), _model_for("specialist"), context_text))
                 for sid in st.session_state.confirmed_ids
             ]
             use_architect = len(st.session_state.confirmed_ids) >= ARCHITECT_MIN_SPECIALISTS
-            architect   = support_architect.architect() if use_architect else None
-            has_auditor = bool(framework_name and framework_name != "None")
-            auditor     = (
+            architect     = support_architect.architect() if use_architect else None
+            has_terraform = any(
+                SPECIALIST_IS_AWS.get(sid, False)
+                for sid in st.session_state.confirmed_ids
+            )
+            terraform_specialist_agent = (
+                support_terraform.terraform_specialist() if has_terraform else None
+            )
+            has_auditor     = bool(framework_name and framework_name != "None")
+            auditor         = (
                 support_auditor.compliance_auditor(
                     framework=framework_name, key_controls=key_controls,
-                    llm_override=auditor_llm,
                 ) if has_auditor else None
             )
-            wiring_reviewer = support_reviewer.wiring_reviewer(llm_override=reviewer_llm)
-            pipeline  = (
-                ([("Architect",      "architect",      architect)]       if architect   else [])
-                + [(sid.upper(),     "specialist",     agent)            for sid, agent in specialist_agents]
-                + ([("Auditor",      "auditor",        auditor)]         if has_auditor else [])
-                + [("Wiring Review", "wiring_reviewer", wiring_reviewer)]
-                + [("Git",           "python",          None)]
+            wiring_reviewer = support_reviewer.wiring_reviewer()
+            pipeline = (
+                ([("Architect",      "architect",            architect)]                  if architect            else [])
+                + [(sid.upper(),     "specialist",           agent)                       for sid, agent in specialist_agents]
+                + ([("Terraform",    "terraform_specialist", terraform_specialist_agent)] if terraform_specialist_agent else [])
+                + ([("Auditor",      "auditor",              auditor)]                   if has_auditor          else [])
+                + [("Wiring Review", "wiring_reviewer",      wiring_reviewer)]
+                + [("Git",           "python",               None)]
             )
-            findings_idx = None
-            crew_agents  = (
-                ([architect] if architect else [])
-                + [agent for _, agent in specialist_agents]
-                + ([auditor]   if has_auditor    else [])
-                + [wiring_reviewer]
-            )
+            findings_idx     = None
+            role_to_card_idx = {
+                agent_obj.role: i
+                for i, (_lbl, _rk, agent_obj) in enumerate(pipeline)
+                if agent_obj is not None
+            }
             tasks = build_tasks(
                 architect=architect, specialist_agents=specialist_agents, auditor=auditor,
                 project_request=st.session_state.project_request,
@@ -1025,108 +1043,34 @@ elif st.session_state.phase == "execute":
                 key_controls=key_controls,
                 existing_context=existing_context,
                 wiring_reviewer=wiring_reviewer,
+                terraform_specialist_agent=terraform_specialist_agent,
+                role_to_card_idx=role_to_card_idx,
             )
 
         git_step_idx = len(pipeline) - 1
 
-        # Capture session state values that the background thread needs.
-        # st.session_state cannot be accessed from threads other than the main one.
-        project_request = st.session_state.project_request
+        # Capture values the background thread needs (st.session_state is not
+        # thread-safe — read everything here before the thread starts).
+        project_request  = st.session_state.project_request
+        cache_enabled    = read_prompt_caching()
+        client           = _client
 
         log_queue     = queue.Queue()
         result_holder = {}
 
-        role_to_idx = {
-            agent_obj.role: i
-            for i, (_label, _tier, agent_obj) in enumerate(pipeline)
-            if agent_obj is not None
-        }
-        if is_auto_iterate:
-            # The remediation fixer (rounds 2+) isn't in the pipeline list; map its
-            # role onto the Auditor card so its activity still lights up there.
-            auditor_idx = next(
-                i for i, (label, _t, _a) in enumerate(pipeline) if label == "Auditor"
-            )
-            role_to_idx[fixer.role] = auditor_idx
-
-        def on_agent_started(source, event):
-            idx = role_to_idx.get(event.agent.role)
-            if idx is not None:
-                log_queue.put(f"__ACTIVE__:{idx}:{pipeline[idx][0]}")
-
-        def on_agent_completed(source, event):
-            idx = role_to_idx.get(event.agent.role)
-            if idx is not None:
-                log_queue.put(f"__DONE__:{idx}:{pipeline[idx][0]}")
-
-        def on_llm_completed(source, event):
-            # CrewAI's Anthropic provider normalises usage keys to
-            # 'cached_prompt_tokens' and 'cache_creation_tokens' (see
-            # crewai/llms/providers/anthropic/completion.py:1829).
-            usage = getattr(event, "usage", None) or {}
-            tier  = _model_tier(getattr(event, "model", None))
-            log_queue.put(
-                f"__USAGE__:{tier}:"
-                f"{int(usage.get('input_tokens', 0) or 0)}:"
-                f"{int(usage.get('output_tokens', 0) or 0)}:"
-                f"{int(usage.get('cached_prompt_tokens', 0) or 0)}:"
-                f"{int(usage.get('cache_creation_tokens', 0) or 0)}"
-            )
-
-        crewai_event_bus.register_handler(AgentExecutionStartedEvent,   on_agent_started)
-        crewai_event_bus.register_handler(AgentExecutionCompletedEvent, on_agent_completed)
-        crewai_event_bus.register_handler(LLMCallCompletedEvent,        on_llm_completed)
-
-        def on_task_complete(task_output):
-            log_queue.put("__STEP__")
-
-        # Single-run modes pre-build a Crew; auto-iterate builds one per round.
-        crew = (
-            None if is_auto_iterate else
-            Crew(
-                agents=crew_agents, tasks=tasks,
-                process=Process.sequential,
-                task_callback=on_task_complete,
-                respect_context_window=True,
-                memory=False, verbose=True,
-            )
-        )
-
-        def _make_crew(agents, tasks_list):
-            return Crew(
-                agents=agents, tasks=tasks_list,
-                process=Process.sequential,
-                task_callback=on_task_complete,
-                respect_context_window=True,
-                memory=False, verbose=True,
-            )
-
-        def run_crew():
-            original_stdout = sys.stdout
-            sys.stdout = QueueCapture(log_queue)
-            log_handler = QueueLogHandler(log_queue)
-            log_handler.setFormatter(logging.Formatter("%(message)s"))
-            root_logger = logging.getLogger()
-            original_level = root_logger.level
-            root_logger.setLevel(logging.DEBUG)
-            root_logger.addHandler(log_handler)
+        def run_pipeline_thread():
             try:
                 if is_auto_iterate:
                     # ── Auto-iterate loop ─────────────────────────────────────
-                    gen_result  = None
-                    audit_text  = ""
-                    converged   = False
-                    round_num   = 0
+                    gen_result = None
+                    audit_text = ""
+                    converged  = False
+                    round_num  = 0
                     for round_num in range(1, max_rounds + 1):
                         log_queue.put(f"__ROUND__:{round_num}:{max_rounds}")
 
-                        # Generate phase. Round 1 is a full pass (architect →
-                        # specialists → inline auditor). Rounds 2+ are targeted
-                        # remediation: a single fixer rewrites only the files the
-                        # previous round's findings named, instead of regenerating
-                        # the whole design.
-                        # variables.tf / outputs.tf are regenerated in pure Python
-                        # at commit time, so never send them to the fixer.
+                        # Generate phase. Round 1 is a full pass. Rounds 2+ are
+                        # targeted remediation: only the files the findings named.
                         affected = (parse_finding_files(audit_text) - {"variables.tf", "outputs.tf"}
                                     if round_num > 1 else set())
                         affected_ctx = (
@@ -1134,23 +1078,19 @@ elif st.session_state.phase == "execute":
                         )
 
                         if round_num > 1 and affected_ctx:
-                            round_tasks = build_remediation_tasks(
+                            round_steps = build_remediation_tasks(
                                 fixer=fixer,
                                 project_request=project_request,
                                 compliance_framework=framework_name,
                                 key_controls=key_controls,
                                 findings_text=audit_text,
                                 affected_context=affected_ctx,
+                                role_to_card_idx=role_to_card_idx,
                             )
-                            gen_crew = _make_crew([fixer], round_tasks)
-                            # Only commit the files the fixer was asked to touch;
-                            # discard anything extra it regenerated from scratch.
                             allowed = affected
                         else:
-                            # Round 1, or a later round whose findings didn't map to
-                            # specific files → fall back to a full generation pass.
                             round_ctx   = read_workspace_context(project_path)
-                            round_tasks = build_tasks(
+                            round_steps = build_tasks(
                                 architect=architect,
                                 specialist_agents=specialist_agents,
                                 auditor=inline_auditor,
@@ -1159,23 +1099,22 @@ elif st.session_state.phase == "execute":
                                 key_controls=key_controls,
                                 existing_context=round_ctx,
                                 wiring_reviewer=wiring_reviewer,
+                                terraform_specialist_agent=terraform_specialist_agent,
+                                role_to_card_idx=role_to_card_idx,
                             )
-                            gen_crew = _make_crew(generate_crew_agents, round_tasks)
                             allowed = None
 
-                        gen_result  = gen_crew.kickoff()
+                        gen_result = run_pipeline(client, round_steps,
+                                                  queue=log_queue, cache=cache_enabled)
 
-                        # Commit the generated files. has_auditor=True: the final
-                        # task (inline auditor or fixer) overwrites only the files
-                        # it changed; unchanged specialist files are preserved.
                         log_queue.put(f"__ACTIVE__:{git_step_idx}:Git")
                         commit_audited_output(gen_result, has_auditor=True, allowed_files=allowed)
                         log_queue.put(f"__DONE__:{git_step_idx}:Git")
 
-                        # Audit phase — re-read workspace (now includes committed files).
+                        # Audit phase (report only — re-reads the committed workspace).
                         log_queue.put(f"__INFO__:Auditing (round {round_num}/{max_rounds})...")
                         audit_ctx   = read_workspace_context(project_path)
-                        audit_tasks = build_tasks(
+                        audit_steps = build_tasks(
                             architect=None, specialist_agents=[],
                             auditor=report_auditor,
                             project_request=project_request,
@@ -1183,16 +1122,12 @@ elif st.session_state.phase == "execute":
                             key_controls=key_controls,
                             existing_context=audit_ctx,
                             audit_only=True,
+                            role_to_card_idx={report_auditor.role: auditor_card_idx},
                         )
-                        audit_crew   = _make_crew([report_auditor], audit_tasks)
-                        audit_result = audit_crew.kickoff()
-                        audit_text   = str(getattr(audit_result, "raw", "") or audit_result)
+                        audit_result = run_pipeline(client, audit_steps,
+                                                    queue=log_queue, cache=cache_enabled)
+                        audit_text   = audit_result.raw
 
-                        # Deterministic integration check: terraform validate catches
-                        # broken cross-resource references (e.g. an IAM policy pointing at
-                        # a bucket that doesn't exist) that the compliance audit misses.
-                        # Its errors are folded into the findings so the next round's
-                        # fixer repairs them alongside compliance gaps.
                         tf = terraform_validate(project_path)
                         tf_clean = (not tf["ran"]) or tf["ok"]
                         if not tf_clean:
@@ -1212,7 +1147,7 @@ elif st.session_state.phase == "execute":
                             count = _count_findings(audit_text) + len(tf["errors"])
                             log_queue.put(f"__FINDINGS__:{round_num}:{count}")
 
-                    result_holder["result"]          = gen_result
+                    result_holder["result"] = gen_result
                     result_holder["auto_iterate_result"] = {
                         "rounds": round_num,
                         "max_rounds": max_rounds,
@@ -1222,7 +1157,7 @@ elif st.session_state.phase == "execute":
 
                 elif is_audit_only:
                     # ── Audit-only single pass ────────────────────────────────
-                    crew_result = crew.kickoff()
+                    crew_result = run_pipeline(client, tasks, queue=log_queue, cache=cache_enabled)
                     result_holder["result"] = crew_result
                     log_queue.put(f"__ACTIVE__:{findings_idx}:Write Findings")
                     result_holder["findings_result"] = write_findings(
@@ -1232,14 +1167,12 @@ elif st.session_state.phase == "execute":
 
                 else:
                     # ── Normal single pass ────────────────────────────────────
-                    crew_result = crew.kickoff()
+                    crew_result = run_pipeline(client, tasks, queue=log_queue, cache=cache_enabled)
                     result_holder["result"] = crew_result
                     log_queue.put(f"__ACTIVE__:{git_step_idx}:Git")
                     result_holder["git_result"] = commit_audited_output(
                         crew_result, has_auditor=has_auditor
                     )
-                    # Single pass has no fix loop, so terraform validate is
-                    # informational here — surface any wiring errors to the user.
                     tf = terraform_validate(project_path)
                     if tf["ran"] and not tf["ok"]:
                         files = ", ".join(sorted({e["file"] for e in tf["errors"] if e["file"]}))
@@ -1255,15 +1188,9 @@ elif st.session_state.phase == "execute":
             except Exception as e:
                 result_holder["error"] = str(e)
             finally:
-                sys.stdout = original_stdout
-                root_logger.removeHandler(log_handler)
-                root_logger.setLevel(original_level)
-                crewai_event_bus.off(AgentExecutionStartedEvent,   on_agent_started)
-                crewai_event_bus.off(AgentExecutionCompletedEvent, on_agent_completed)
-                crewai_event_bus.off(LLMCallCompletedEvent,         on_llm_completed)
                 log_queue.put(None)
 
-        thread = threading.Thread(target=run_crew, daemon=True)
+        thread = threading.Thread(target=run_pipeline_thread, daemon=True)
         thread.start()
 
         st.session_state.pipeline_running       = True

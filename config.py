@@ -37,6 +37,20 @@ def write_dark_mode(dark: bool) -> None:
     else:
         content += f'\n[theme]\nbase = "{base}"\n'
     STREAMLIT_CONFIG_PATH.write_text(content)
+
+
+def read_prompt_caching() -> bool:
+    """Return True if prompt caching is enabled (default False)."""
+    return os.environ.get("ANTHROPIC_PROMPT_CACHING", "0") == "1"
+
+
+def write_prompt_caching(enabled: bool) -> None:
+    """Persist prompt caching preference to .env and reload into os.environ."""
+    set_key(DOTENV_PATH, "ANTHROPIC_PROMPT_CACHING", "1" if enabled else "0")
+    load_dotenv(DOTENV_PATH, override=True)
+    os.environ["ANTHROPIC_PROMPT_CACHING"] = "1" if enabled else "0"
+
+
 load_dotenv(DOTENV_PATH)
 
 USE_BEDROCK = os.environ.get("LLM_PROVIDER", "anthropic").lower() == "bedrock"
@@ -64,21 +78,23 @@ TIER_COLORS  = {"haiku": "#10B981", "sonnet": "#6366F1", "opus": "#F59E0B"}
 TIER_ICONS   = {"haiku": "🟢",      "sonnet": "🟣",      "opus": "🟠"}
 
 DEFAULT_MODEL_ASSIGNMENTS: dict[str, str] = {
-    "planner":         "haiku",
-    "architect":       "opus",
-    "specialist":      "sonnet",
-    "auditor":         "opus",
-    "wiring_reviewer": "sonnet",
-    "remediation":     "sonnet",
+    "planner":              "haiku",
+    "architect":            "haiku",
+    "specialist":           "haiku",
+    "terraform_specialist": "haiku",
+    "auditor":              "haiku",
+    "wiring_reviewer":      "haiku",
+    "remediation":          "haiku",
 }
 
 ROLE_LABELS: dict[str, str] = {
-    "planner":         "Planner",
-    "architect":       "Architect",
-    "specialist":      "Specialists",
-    "auditor":         "Auditor",
-    "wiring_reviewer": "Wiring Reviewer",
-    "remediation":     "Remediation Eng.",
+    "planner":              "Planner",
+    "architect":            "Architect",
+    "specialist":           "Specialists",
+    "terraform_specialist": "Terraform Specialist",
+    "auditor":              "Auditor",
+    "wiring_reviewer":      "Wiring Reviewer",
+    "remediation":          "Remediation Eng.",
 }
 
 # Human-readable labels for each provider type shown in the UI.
